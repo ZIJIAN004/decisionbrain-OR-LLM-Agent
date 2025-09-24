@@ -42,13 +42,13 @@ anthropic_client = anthropic.Anthropic(
     api_key=anthropic_api_data['api_key']
 )
 
-def query_llm(messages, model_name="o3-mini", temperature=0.2):
+def query_llm(messages, model_name="o3", temperature=0.2):
     """
     Call LLM to get response results.
     
     Args:
         messages (list): List of conversation context.
-        model_name (str): LLM model name, default is "o3-mini".
+        model_name (str): LLM model name, default is "o3".
         temperature (float): Controls the randomness of output, default is 0.2.
 
     Returns:
@@ -124,7 +124,7 @@ def generate_or_code_solver(messages_bak, model_name, max_attempts):
     print(f"Reached maximum number of attempts ({max_attempts}), could not execute code successfully.")
     return False, None, messages_bak
 
-def or_llm_agent(user_question, model_name="o3-mini", max_attempts=3):
+def or_llm_agent(user_question, model_name="o3", max_attempts=3):
     """
     Request Gurobi code solution from LLM and execute it, attempt to fix if it fails.
 
@@ -193,7 +193,7 @@ def or_llm_agent(user_question, model_name="o3-mini", max_attempts=3):
     
     return is_solve_success, result
 
-def gpt_code_agent_simple(user_question, model_name="o3-mini", max_attempts=3):
+def gpt_code_agent_simple(user_question, model_name="o3", max_attempts=3):
     """
     Request Gurobi code solution from LLM and execute it, attempt to fix if it fails.
 
@@ -235,7 +235,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Run optimization problem solving with LLMs')
     parser.add_argument('--agent', action='store_true', 
                         help='Use the agent. If not specified, directly use the model to solve the problem')
-    parser.add_argument('--model', type=str, default='o3-mini',
+    parser.add_argument('--model', type=str, default='o3',
                         help='Model name to use for LLM queries. Use "claude-..." for Claude models.')
     parser.add_argument('--data_path', type=str, default='data/datasets/IndustryOR.json',
                         help='Path to the dataset JSON file (supports both JSONL and regular JSON formats)')
