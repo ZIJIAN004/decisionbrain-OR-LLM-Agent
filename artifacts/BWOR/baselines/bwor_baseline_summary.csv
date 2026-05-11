@@ -1,0 +1,10 @@
+family,mode,model,correct,total,accuracy_percent,source_note
+GPT,non_reasoning,GPT-4o,33,82,40.24,local aggregate run
+GPT,reasoning,GPT-o3,62,82,75.61,local aggregate run
+GPT,agent,OR-LLM-Agent (GPT-o3),65,82,79.27,local aggregate run
+Gemini,non_reasoning,Gemini 2.0 Flash,41,82,50.00,local aggregate run
+Gemini,reasoning,Gemini 2.5 Pro,59,82,71.95,local aggregate run
+Gemini,agent,OR-LLM-Agent (Gemini 2.5 Pro),66,82,80.49,local aggregate run
+DeepSeek,non_reasoning,DeepSeek-V3,51,82,62.20,local aggregate run
+DeepSeek,reasoning,DeepSeek-R1,60,82,73.17,paper aggregate
+DeepSeek,agent,OR-LLM-Agent (DeepSeek-R1),68,82,82.93,local aggregate run

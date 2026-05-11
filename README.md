@@ -48,7 +48,7 @@ OR-LLM-Agent is an LLM-based framework that fully automates OR optimization by c
 ### Installation Steps
 ```bash
 # Clone the repository
-git https://github.com/bwz96sco/or_llm_agent.git
+git clone https://github.com/bwz96sco/or_llm_agent.git
 cd or_llm_agent
 
 # Install package
@@ -78,6 +78,19 @@ You need to set the OPENAI_API_KEY and OPENAI_API_BASE url(if you want to use Op
 ```
 https://ark.cn-beijing.volces.com/api/v3
 ```
+
+## BWOR Resource Artifacts
+
+The BWOR benchmark used in the resource paper is released with stable IDs and public metadata:
+
+- Dataset JSONL: [`data/datasets/bwor.jsonl`](data/datasets/bwor.jsonl)
+- Hugging Face dataset: [`SJTU/BWOR`](https://huggingface.co/datasets/SJTU/BWOR)
+- Zenodo archive: [`10.5281/zenodo.20120692`](https://doi.org/10.5281/zenodo.20120692)
+- Artifact notes: [`artifacts/BWOR/README.md`](artifacts/BWOR/README.md)
+- Prompt templates: [`artifacts/BWOR/prompts.md`](artifacts/BWOR/prompts.md)
+- Baseline aggregate counts: [`artifacts/BWOR/baselines/bwor_baseline_summary.csv`](artifacts/BWOR/baselines/bwor_baseline_summary.csv)
+
+Raw provider logs are not committed because they can include provider-side diagnostics and local execution traces. Use the scripts in this repository to regenerate evaluation outputs when exact run logs are needed.
 
 <br><br><br>
 

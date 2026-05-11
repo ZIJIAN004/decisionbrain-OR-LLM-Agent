@@ -177,7 +177,17 @@ data/results
 data/datasets/LPWP
 
 data/datasets/ComplexOR
+data/datasets/nl4or.jsonl
 
 model.ilp
 
 *.ilp
+
+# Local agent/runtime artifacts
+.agents/
+.claude/
+.codex/
+.trellis/
+.github/
+**/shared-references/
+**/outputs/runtime/
