@@ -23,6 +23,8 @@ The default metric is exact instance-level correctness under solver-grounded eva
 
 Reported aggregate accuracy uses all 82 records as the denominator: 80 numeric optimal records and 2 no-optimal records.
 
+Use `scripts/evaluate_bwor_predictions.py` to evaluate JSONL prediction files keyed by `id`.
+
 ## Provenance
 
 The source problems are derived from Chinese OR teaching materials cited in the paper, translated and normalized into English while preserving the original Chinese statements. The public release is intended for research evaluation of OR modeling, solver-code generation, and LLM-based OR assistants.

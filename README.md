@@ -89,6 +89,7 @@ The BWOR benchmark used in the resource paper is released with stable IDs and pu
 - Artifact notes: [`artifacts/BWOR/README.md`](artifacts/BWOR/README.md)
 - Prompt templates: [`artifacts/BWOR/prompts.md`](artifacts/BWOR/prompts.md)
 - Baseline aggregate counts: [`artifacts/BWOR/baselines/bwor_baseline_summary.csv`](artifacts/BWOR/baselines/bwor_baseline_summary.csv)
+- Prediction evaluator: [`scripts/evaluate_bwor_predictions.py`](scripts/evaluate_bwor_predictions.py)
 
 Raw provider logs are not committed because they can include provider-side diagnostics and local execution traces. Use the scripts in this repository to regenerate evaluation outputs when exact run logs are needed.
 
