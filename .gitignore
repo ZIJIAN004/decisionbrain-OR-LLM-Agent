@@ -187,7 +187,11 @@ model.ilp
 .agents/
 .claude/
 .codex/
-.trellis/
+.trellis/*
+!.trellis/
+!.trellis/.gitignore
+!.trellis/spec/
+!.trellis/spec/**
 .github/
 **/shared-references/
 **/outputs/runtime/

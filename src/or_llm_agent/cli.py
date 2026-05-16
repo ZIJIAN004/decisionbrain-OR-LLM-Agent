@@ -19,6 +19,7 @@ from or_llm_agent.bwor import (
     repo_root,
 )
 from or_llm_agent.code_blocks import extract_python_module, has_build_model_contract
+from or_llm_agent.codex_agent import CodexAgentOptions, CodexAgentPaths, build_agent_paths, run_codex_agent
 from or_llm_agent.or_ci import VerificationResult, or_ci_command, run_or_ci_verify
 from or_llm_agent.prompts import OR_CI_SYSTEM_PROMPT, build_or_ci_prompt
 from or_llm_agent.provider import query_llm, required_env_names
@@ -61,14 +62,18 @@ def build_parser() -> argparse.ArgumentParser:
     health = subparsers.add_parser("health", help="check local OR-LLM-Agent and OR-CI readiness")
     health.add_argument("--model", default="o3-mini")
     health.add_argument("--live", action="store_true", help="perform a minimal provider request")
+    health.add_argument("--agent", action="store_true", help="check Codex agent-mode readiness")
 
     generate = subparsers.add_parser("generate", help="generate an OR-CI build_model submission for a BWOR id")
     generate.add_argument("--bwor-id", required=True)
     generate.add_argument("--model", default="o3-mini")
+    generate.add_argument("--mode", choices=("api", "agent"), default="api")
     generate.add_argument("--out", required=True, type=Path)
     generate.add_argument("--raw", required=True, type=Path)
+    generate.add_argument("--artifact-dir", type=Path, help="agent-mode artifact root; defaults to raw output parent")
     generate.add_argument("--dataset", default=default_bwor_dataset(), type=Path)
     generate.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    _add_agent_options(generate)
 
     verify = subparsers.add_parser("verify", help="verify a generated submission with standalone OR-CI")
     verify.add_argument("--problem", required=True, type=Path)
@@ -78,28 +83,42 @@ def build_parser() -> argparse.ArgumentParser:
     pilot = subparsers.add_parser("pilot", help="run generate plus OR-CI verify for a BWOR batch")
     pilot.add_argument("--ids", required=True, nargs="+")
     pilot.add_argument("--model", default="o3-mini")
+    pilot.add_argument("--mode", choices=("api", "agent"), default="api")
     pilot.add_argument("--artifact-dir", required=True, type=Path)
     pilot.add_argument("--dataset", default=default_bwor_dataset(), type=Path)
     pilot.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
     pilot.add_argument("--reuse-submissions", action="store_true")
+    _add_agent_options(pilot)
     return parser
+
+
+def _add_agent_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--codex-model", help="agent mode: model for nested codex exec")
+    parser.add_argument("--codex-sandbox", default="workspace-write", choices=("read-only", "workspace-write", "danger-full-access"))
+    parser.add_argument("--codex-approval", default="never", choices=("untrusted", "on-failure", "on-request", "never"))
+    parser.add_argument("--max-repair-attempts", default=3, type=int)
+    parser.add_argument("--codex-timeout-seconds", default=900, type=int, help="agent mode: timeout for one nested codex exec run; <=0 disables")
 
 
 def health_command(args: argparse.Namespace) -> int:
     load_dotenv()
     checks: list[tuple[str, bool, str]] = []
 
-    env_names = required_env_names(args.model)
-    if len(env_names) == 1:
-        checks.append((env_names[0], os.getenv(env_names[0]) is not None, env_status(*env_names)))
+    if args.agent:
+        checks.append(_check_codex_cli())
+        checks.append(_check_codex_exec())
     else:
-        checks.append(("Claude provider key", any(os.getenv(name) for name in env_names), env_status(*env_names)))
+        env_names = required_env_names(args.model)
+        if len(env_names) == 1:
+            checks.append((env_names[0], bool(os.getenv(env_names[0])), env_status(*env_names)))
+        else:
+            checks.append(("Claude provider key", any(os.getenv(name) for name in env_names), env_status(*env_names)))
+        checks.append(("OPENAI_API_BASE", True, env_status("OPENAI_API_BASE") if not args.model.lower().startswith("claude") else "not used"))
 
-    checks.append(("OPENAI_API_BASE", True, env_status("OPENAI_API_BASE") if not args.model.lower().startswith("claude") else "not used"))
     checks.append(_check_gurobi())
     checks.append(_check_or_ci_import())
     checks.append(_check_or_ci_cli())
-    if args.live:
+    if args.live and not args.agent:
         checks.append(_check_live_provider(args.model))
 
     for name, ok, detail in checks:
@@ -110,14 +129,35 @@ def health_command(args: argparse.Namespace) -> int:
 
 
 def generate_command(args: argparse.Namespace) -> int:
-    result = generate_submission(
-        problem_id=args.bwor_id,
-        model=args.model,
-        out_path=args.out,
-        raw_path=args.raw,
-        dataset_path=args.dataset,
-        or_ci_root=args.or_ci_root,
-    )
+    if args.mode == "agent":
+        paths = build_agent_paths(
+            problem_id=args.bwor_id,
+            artifact_root=(args.artifact_dir or args.raw.parent),
+            submission_path=args.out,
+            raw_path=args.raw,
+        )
+        result = generate_agent_submission(
+            problem_id=args.bwor_id,
+            paths=paths,
+            args=args,
+        )
+        problem_path = default_problem_path(args.bwor_id, args.or_ci_root)
+        verification = run_or_ci_verify(
+            problem_path=problem_path,
+            submission_path=paths.submission_path,
+            report_path=paths.report_path,
+            cwd=repo_root(),
+        )
+        print(f"{args.bwor_id}: final_classification={verification.classification} status={verification.status}")
+    else:
+        result = generate_submission(
+            problem_id=args.bwor_id,
+            model=args.model,
+            out_path=args.out,
+            raw_path=args.raw,
+            dataset_path=args.dataset,
+            or_ci_root=args.or_ci_root,
+        )
     print(f"{args.bwor_id}: generation={result['generation_status']}")
     if result["generation_error"]:
         print(redact_text(result["generation_error"]), file=sys.stderr)
@@ -157,7 +197,21 @@ def pilot_command(args: argparse.Namespace) -> int:
                 "generation_error": "",
                 "raw_response": raw_path,
                 "submission": submission_path,
+                "generation_mode": args.mode,
+                "agent_returncode": None,
             }
+        elif args.mode == "agent":
+            generation = generate_agent_submission(
+                problem_id=problem_id,
+                paths=build_agent_paths(
+                    problem_id=problem_id,
+                    artifact_root=artifact_dir,
+                    submission_path=submission_path,
+                    raw_path=raw_path,
+                    report_path=report_path,
+                ),
+                args=args,
+            )
         else:
             generation = generate_submission(
                 problem_id=problem_id,
@@ -237,12 +291,68 @@ def generate_submission(
     return _generation_result("generated", "", raw_path, out_path)
 
 
+def generate_agent_submission(
+    *,
+    problem_id: str,
+    paths: CodexAgentPaths,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    record = load_bwor_record(args.dataset, problem_id)
+    problem_path = default_problem_path(problem_id, args.or_ci_root)
+    if not problem_path.is_file():
+        raise CLIError(f"problem file does not exist: {problem_path}")
+    problem = load_problem(problem_path)
+    result = run_codex_agent(
+        problem_id=problem_id,
+        record=record,
+        problem=problem,
+        problem_path=problem_path.resolve(),
+        paths=paths,
+        options=CodexAgentOptions(
+            codex_model=args.codex_model,
+            codex_sandbox=args.codex_sandbox,
+            codex_approval=args.codex_approval,
+            max_repair_attempts=args.max_repair_attempts,
+            timeout_seconds=args.codex_timeout_seconds,
+        ),
+        verify_command=or_ci_command()[0],
+    )
+
+    if not paths.submission_path.exists():
+        error = f"codex exec did not write submission; returncode={result.returncode}"
+        paths.submission_path.write_text("# agent mode did not produce a submission\n", encoding="utf-8")
+        status = "agent_failed"
+    else:
+        code = paths.submission_path.read_text(encoding="utf-8")
+        if has_build_model_contract(code):
+            status = "generated"
+            error = "" if result.returncode == 0 else f"codex exec returned nonzero status: {result.returncode}"
+        else:
+            status = "generated_without_build_model"
+            error = "agent submission did not contain def build_model"
+
+    payload = _generation_result(status, error, paths.raw_path, paths.submission_path)
+    payload.update(
+        {
+            "generation_mode": "agent",
+            "agent_returncode": result.returncode,
+            "agent_timed_out": result.timed_out,
+            "agent_status": paths.status_path,
+            "last_message": paths.last_message_path,
+            "codex_events": paths.events_path,
+        }
+    )
+    return payload
+
+
 def _generation_result(status: str, error: str, raw_path: Path, out_path: Path) -> dict[str, Any]:
     return {
         "generation_status": status,
         "generation_error": redact_text(error),
         "raw_response": raw_path,
         "submission": out_path,
+        "generation_mode": "api",
+        "agent_returncode": None,
     }
 
 
@@ -258,11 +368,14 @@ def build_pilot_row(
     return {
         "problem_id": problem_id,
         "model": model,
+        "generation_mode": generation.get("generation_mode", "api"),
         "generation_status": generation["generation_status"],
         "generation_error": generation["generation_error"],
         "submission": _relative(generation["submission"], artifact_dir),
         "raw_response": _relative(generation["raw_response"], artifact_dir),
         "report": _relative(report_path, artifact_dir),
+        "agent_returncode": generation.get("agent_returncode"),
+        "agent_timed_out": generation.get("agent_timed_out"),
         "verify_returncode": verification.returncode,
         "verify_stdout": verification.stdout,
         "verify_stderr": verification.stderr,
@@ -276,33 +389,44 @@ def build_pilot_row(
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     classifications: dict[str, int] = {}
     generation_statuses: dict[str, int] = {}
+    generation_modes: dict[str, int] = {}
     for row in rows:
         classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
         generation_statuses[row["generation_status"]] = generation_statuses.get(row["generation_status"], 0) + 1
+        generation_modes[row.get("generation_mode", "api")] = generation_modes.get(row.get("generation_mode", "api"), 0) + 1
     return {
         "total": len(rows),
         "classifications": classifications,
         "generation_statuses": generation_statuses,
+        "generation_modes": generation_modes,
     }
 
 
 def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     matrix = [
-        "| Problem | Generation | OR-CI Classification | Failure Check | Submission | Report |",
-        "|---|---|---|---|---|---|",
+        "| Problem | Mode | Generation | Agent RC | OR-CI Classification | Failure Check | Submission | Report |",
+        "|---|---|---|---:|---|---|---|---|",
     ]
     for row in rows:
         matrix.append(
-            f"| {row['problem_id']} | `{row['generation_status']}` | `{row['classification']}` | "
+            f"| {row['problem_id']} | `{row.get('generation_mode', 'api')}` | `{row['generation_status']}` | "
+            f"`{row.get('agent_returncode') if row.get('agent_returncode') is not None else '-'}` | `{row['classification']}` | "
             f"`{row['failure_check'] or '-'}` | `{row['submission']}` | `{row['report']}` |"
         )
 
-    current_result = (
-        "BLOCKED: provider generation failed for every requested problem. "
-        "See `summary.json` and `raw/*.txt` for sanitized provider errors."
-        if summary["generation_statuses"].get("failed") == summary["total"]
-        else "COMPLETED: at least one generated or reused submission reached OR-CI verification."
-    )
+    any_generated = any(row["generation_status"] in {"generated", "reused"} for row in rows)
+    if any_generated:
+        current_result = "COMPLETED: at least one generated or reused submission reached OR-CI verification."
+    elif summary["generation_statuses"].get("failed") == summary["total"]:
+        current_result = (
+            "BLOCKED: provider generation failed for every requested problem. "
+            "See `summary.json` and `raw/*.txt` for sanitized provider errors."
+        )
+    else:
+        current_result = (
+            "BLOCKED: generation did not produce a valid submission for any requested problem. "
+            "See `summary.json` and the raw or agent status artifacts for details."
+        )
 
     path.write_text(
         f"""# OR-CI Integration Pilot Report
@@ -368,6 +492,23 @@ def _check_or_ci_cli() -> tuple[str, bool, str]:
         return "or-ci CLI", False, redact_text(exc)
     detail = redact_text((result.stdout or result.stderr).splitlines()[0] if (result.stdout or result.stderr) else "")
     return "or-ci CLI", result.returncode == 0, f"{mode}: {detail or f'returncode={result.returncode}'}"
+
+
+def _check_codex_cli() -> tuple[str, bool, str]:
+    return _check_command("Codex CLI", ["codex", "--help"])
+
+
+def _check_codex_exec() -> tuple[str, bool, str]:
+    return _check_command("Codex exec", ["codex", "exec", "--help"])
+
+
+def _check_command(name: str, command: list[str]) -> tuple[str, bool, str]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return name, False, redact_text(exc)
+    detail = (result.stdout or result.stderr).splitlines()[0] if (result.stdout or result.stderr) else ""
+    return name, result.returncode == 0, redact_text(detail or f"returncode={result.returncode}")
 
 
 def _check_live_provider(model: str) -> tuple[str, bool, str]:
