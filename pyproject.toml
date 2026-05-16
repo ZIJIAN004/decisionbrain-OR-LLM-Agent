@@ -11,6 +11,10 @@ dependencies = [
     "mcp[cli]>=1.6.0",
     "numpy==2.2.3",
     "openai==1.66.3",
+    "or-ci",
     "python-dotenv==1.0.1",
     "scipy==1.15.2",
 ]
+
+[tool.uv.sources]
+or-ci = { path = "../or-ci", editable = true }
