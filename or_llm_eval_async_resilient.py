@@ -1,6 +1,3 @@
-import openai
-import anthropic
-from dotenv import load_dotenv
 import os
 import re
 import subprocess
@@ -10,7 +7,7 @@ import tempfile
 import json
 import asyncio
 import argparse
-from itertools import zip_longest
+from or_llm_agent.provider import async_query_llm as _provider_async_query_llm
 from utils import (
     is_number_string,
     convert_to_number,
@@ -53,98 +50,17 @@ MAX_ATTEMPT_ERROR_PROMPT = (
     "以 ```python\n{code}\n``` 形式输出，无需输出代码解释。"
 )
 
-# Load environment variables from .env file
-load_dotenv()
-
-# OpenAI API setup
-openai_api_data = dict(
-    api_key = os.getenv("OPENAI_API_KEY"),
-    base_url = os.getenv("OPENAI_API_BASE")
-)
-
-# Anthropic API setup
-anthropic_api_data = dict(
-    api_key = os.getenv("CLAUDE_API_KEY"),
-)
-
-# Initialize clients
-openai_client = openai.AsyncOpenAI(
-    api_key=openai_api_data['api_key'],
-    base_url=openai_api_data['base_url'] if openai_api_data['base_url'] else None
-)
-
-anthropic_client = anthropic.AsyncAnthropic(
-    api_key=anthropic_api_data['api_key']
-)
-
 async def async_query_llm(messages, model_name="o3-mini", temperature=0.2, max_attempts=3):
     """
     Async version of query_llm that supports both OpenAI and Claude models with retry functionality.
     Returns (success, result) tuple instead of raising exceptions after max attempts.
     """
-    import time
-    
-    for attempt in range(max_attempts):
-        try:
-            # Check if model is Claude (Anthropic)
-            if model_name.lower().startswith("claude"):
-                # Convert OpenAI message format to Anthropic format
-                system_message = next((m["content"] for m in messages if m["role"] == "system"), "")
-                user_messages = [m["content"] for m in messages if m["role"] == "user"]
-                assistant_messages = [m["content"] for m in messages if m["role"] == "assistant"]
-                
-                # Combine messages into a single conversation string
-                conversation = system_message + "\n\n"
-                for user_msg, asst_msg in zip_longest(user_messages, assistant_messages, fillvalue=None):
-                    if user_msg:
-                        conversation += f"Human: {user_msg}\n\n"
-                    if asst_msg:
-                        conversation += f"Assistant: {asst_msg}\n\n"
-                
-                # Add the final user message if there is one
-                if len(user_messages) > len(assistant_messages):
-                    conversation += f"Human: {user_messages[-1]}\n\n"
-
-                response = await anthropic_client.messages.create(
-                    model=model_name,
-                    max_tokens=8192,
-                    temperature=temperature,
-                    messages=[{
-                        "role": "user",
-                        "content": conversation
-                    }]
-                )
-                return True, response.content[0].text
-            else:
-                # Use OpenAI API
-                response = await openai_client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=temperature
-                )
-                return True, response.choices[0].message.content
-                
-        except (openai.APIConnectionError, anthropic.APIConnectionError) as e:
-            print(f"[Connection Error] Attempt {attempt + 1}/{max_attempts} failed for model {model_name}")
-            print(f"[Connection Error] Error details: {str(e)}")
-            print(f"[Connection Error] Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            if attempt < max_attempts - 1:
-                # Exponential backoff: 2^attempt seconds (2, 4, 8, ...)
-                wait_time = 60 * (attempt + 1)
-                print(f"[Connection Error] Retrying in {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
-            else:
-                print(f"[Connection Error] Max attempts ({max_attempts}) reached. Continuing with failure.")
-                return False, f"Connection error after {max_attempts} attempts: {str(e)}"
-                
-        except Exception as e:
-            # For other types of errors, don't retry
-            print(f"[API Error] Non-connection error occurred with model {model_name}: {str(e)}")
-            print(f"[API Error] Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            return False, f"API error: {str(e)}"
-    
-    return False, "Unknown error occurred"
+    return await _provider_async_query_llm(
+        messages,
+        model_name=model_name,
+        temperature=temperature,
+        max_attempts=max_attempts,
+    )
 
 async def async_extract_and_execute_python_code(text_content):
     """
