@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,7 @@ from or_llm_agent.redaction import redact_text
 @dataclass(frozen=True)
 class CodexAgentPaths:
     artifact_root: Path
+    work_dir: Path
     session_dir: Path
     events_path: Path
     last_message_path: Path
@@ -52,6 +55,7 @@ def build_agent_paths(
     root = artifact_root.resolve()
     return CodexAgentPaths(
         artifact_root=root,
+        work_dir=_neutral_work_dir(root, problem_id),
         session_dir=root / "sessions" / problem_id,
         events_path=root / "sessions" / problem_id / "codex-events.jsonl",
         last_message_path=root / "sessions" / problem_id / "last-message.md",
@@ -104,6 +108,7 @@ def run_codex_agent(
         timeout_message = f"codex exec timed out after {options.timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    harvested = _harvest_work_dir_artifacts(paths)
     paths.events_path.write_text(redact_text(stdout), encoding="utf-8")
     raw_payload = {
         "problem_id": problem_id,
@@ -112,6 +117,8 @@ def run_codex_agent(
         "timed_out": timed_out,
         "events_path": str(paths.events_path),
         "last_message_path": str(paths.last_message_path),
+        "work_dir": str(paths.work_dir),
+        "harvested_artifacts": harvested,
         "stderr": redact_text(stderr),
     }
     if not paths.last_message_path.exists():
@@ -131,6 +138,7 @@ def run_codex_agent(
             "report_path": str(paths.report_path),
             "events_path": str(paths.events_path),
             "last_message_path": str(paths.last_message_path),
+            "work_dir": str(paths.work_dir),
             "status_path": str(paths.status_path),
         }
     )
@@ -166,7 +174,7 @@ def build_codex_command(paths: CodexAgentPaths, options: CodexAgentOptions) -> l
         "exec",
         "--json",
         "-C",
-        str(paths.session_dir),
+        str(paths.work_dir),
         "--add-dir",
         str(paths.artifact_root),
         "--skip-git-repo-check",
@@ -200,13 +208,24 @@ Goal: generate one OR-CI submission for `{problem_id}`, verify it, inspect failu
 Write only inside this artifact workspace:
 {paths.artifact_root}
 
+Current Codex working directory for temporary files:
+{paths.work_dir}
+
 Required output paths:
 - Submission Python module: {paths.submission_path}
 - OR-CI report JSON: {paths.report_path}
 - Agent status JSON: {paths.status_path}
 - Final answer message: {paths.last_message_path}
 
-Do not edit repository source files. Do not write outside the artifact workspace.
+Do not edit repository source files. Final artifacts must be written only inside the artifact workspace. Temporary files may be created in the current Codex working directory and then moved or copied to the required output paths.
+
+If the sandbox blocks writes to the absolute artifact workspace, write the same relative files under the current Codex working directory instead:
+- submissions/{problem_id}.py
+- reports/{problem_id}.json
+- agent-status/{problem_id}.json
+- sessions/{problem_id}/last-message.md
+
+The parent CLI will harvest those fallback files after Codex exits.
 
 Natural language problem:
 {question}
@@ -234,6 +253,7 @@ def build_model(data: dict) -> gp.Model:
 ```
 
 Rules:
+- You have enough information in this prompt to use standard gurobipy Model/addVars/addConstr/setObjective patterns; do not fetch external docs unless verification fails because a Gurobi API call is unknown.
 - Return an unoptimized gurobipy.Model.
 - Do not call optimize() inside build_model.
 - Do not print output from the submission module.
@@ -241,6 +261,7 @@ Rules:
 - Do not hard-code the known optimal objective value or solution.
 - Use values from the data argument so transformed OR-CI data changes the model.
 - Do not use evaluation_only fields; they are not passed to build_model.
+- Do not run cleanup or removal commands; leave generated cache files alone.
 
 Verification command template:
 ```bash
@@ -253,11 +274,43 @@ Process:
 3. If verification fails, read the report JSON and repair the submission. Repeat up to {options.max_repair_attempts} repair attempts.
 4. Write status JSON to the exact status path with at least: problem_id, attempts, final_classification, final_status, submission_path, report_path.
 5. End with a concise final message summarizing generation status and OR-CI classification.
+
+Start now. Complete the workflow without asking for confirmation.
 """
+
+
+def _neutral_work_dir(artifact_root: Path, problem_id: str) -> Path:
+    root_hash = hashlib.sha256(str(artifact_root).encode("utf-8")).hexdigest()[:16]
+    return Path.home() / ".cache" / "or_llm_agent" / "codex-work" / root_hash / problem_id
+
+
+def _harvest_work_dir_artifacts(paths: CodexAgentPaths) -> list[str]:
+    harvested: list[str] = []
+    pairs = (
+        (paths.work_dir / "submissions" / paths.submission_path.name, paths.submission_path),
+        (paths.work_dir / paths.submission_path.name, paths.submission_path),
+        (paths.work_dir / "reports" / paths.report_path.name, paths.report_path),
+        (paths.work_dir / paths.report_path.name, paths.report_path),
+        (paths.work_dir / "agent-status" / paths.status_path.name, paths.status_path),
+        (
+            paths.work_dir / "sessions" / paths.session_dir.name / paths.last_message_path.name,
+            paths.last_message_path,
+        ),
+    )
+    for source, target in pairs:
+        if not source.is_file():
+            continue
+        if target.exists() and target.stat().st_size > 0:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        harvested.append(str(target))
+    return harvested
 
 
 def _ensure_agent_dirs(paths: CodexAgentPaths) -> None:
     for path in (
+        paths.work_dir,
         paths.session_dir,
         paths.submission_path.parent,
         paths.report_path.parent,

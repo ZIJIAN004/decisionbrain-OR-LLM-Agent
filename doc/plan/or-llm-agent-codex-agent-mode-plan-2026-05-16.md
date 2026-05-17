@@ -28,23 +28,35 @@ The spawned Codex session should generate `build_model(data)`, run OR-CI, repair
 
 ## Agent Mode Behavior
 
-- `generate --mode agent` creates a per-problem artifact workspace and runs:
+- `generate --mode agent` creates a per-problem artifact workspace, a neutral
+  Codex work directory under `~/.cache/or_llm_agent/codex-work/`, and runs:
 
 ```bash
-codex exec \
-  -C <problem-artifact-dir> \
+codex -a never exec \
+  -C <neutral-codex-work-dir> \
+  --add-dir <artifact-dir> \
   --skip-git-repo-check \
-  --sandbox workspace-write \
-  --ask-for-approval never \
+  -s workspace-write \
+  --output-last-message <artifact-dir>/sessions/<BWOR-ID>/last-message.md \
   ...
 ```
 
+- Do not use an OR-CI repository or artifact path as the `-C` working directory.
+  Local testing showed that `codex exec` can no-op with `input_tokens=0` when
+  `-C` points inside the OR-CI tree, even for trivial prompts.
+- The spawned Codex session first tries to write the absolute artifact paths. If
+  the Codex sandbox blocks those writes, it writes the same relative files under
+  the neutral work directory. The parent CLI harvests these fallback files back
+  into the requested artifact directory after Codex exits.
 - Do not pass `--ephemeral`; the Codex session should persist and be resumable.
 - The Codex prompt must include:
   - BWOR natural-language problem text
   - OR-CI `problem.json` instance and metamorphic config
   - absolute output paths for submission, report, final message, and status JSON
-  - instruction to write only inside the artifact workspace
+  - neutral work directory path for temporary or fallback files
+  - fallback relative artifact paths for sandbox-blocked writes
+  - instruction to write final artifacts only inside the artifact workspace
+  - explicit instruction to start the workflow immediately
   - instruction to create `def build_model(data: dict) -> gurobipy.Model`, run OR-CI, inspect failures, and repair until success or attempt limit
 - After `codex exec` exits, the parent CLI always runs one final `or-ci verify` itself and uses that result for `summary.json`.
 - `pilot --mode agent` runs one Codex session per BWOR id, not one batch-wide session.
@@ -69,6 +81,7 @@ Batch output remains:
 
 - `generation_mode: "agent"`
 - `agent_returncode`
+- `agent_timed_out`
 
 It preserves existing fields:
 
@@ -76,6 +89,10 @@ It preserves existing fields:
 - `classification`
 - `failure_check`
 - `checks`
+
+`raw/<BWOR-ID>.txt` records the nested Codex command, return code, timeout
+status, neutral work directory, and any fallback artifacts harvested by the
+parent CLI.
 
 ## Implementation Notes
 
@@ -90,6 +107,7 @@ It preserves existing fields:
 
 - Static checks:
   - `uv run python -m compileall src/or_llm_agent`
+  - `uv run python -m unittest tests.test_codex_agent`
   - `uv run or-llm-agent --help`
   - `uv run or-llm-agent generate --help`
   - `uv run or-llm-agent pilot --help`
@@ -103,6 +121,34 @@ It preserves existing fields:
 - Regression:
   - `uv run or-llm-agent pilot --mode api ...` still behaves as before
   - from `../or-ci`, run `uv run pytest` and confirm OR-CI remains standalone
+
+## Implementation Outcome: 2026-05-16 / 2026-05-17
+
+- Initial agent-mode reruns failed before generation because nested `codex exec`
+  exited with return code `0`, no final message, and `input_tokens=0`.
+- Minimal reproduction showed this no-op behavior when `-C` pointed inside the
+  OR-CI repository or artifact tree.
+- The implementation now runs nested Codex from a neutral cache work directory
+  and passes the requested artifact directory with `--add-dir`.
+- Nested Codex may still be unable to write absolute artifact paths directly from
+  the neutral workdir. The parent CLI therefore harvests fallback files from:
+  - `submissions/<BWOR-ID>.py`
+  - `reports/<BWOR-ID>.json`
+  - `agent-status/<BWOR-ID>.json`
+  - `sessions/<BWOR-ID>/last-message.md`
+- Successful pilot:
+
+```bash
+uv run or-llm-agent pilot \
+  --mode agent \
+  --ids BWOR-001 BWOR-002 BWOR-010 \
+  --artifact-dir ../or-ci/artifacts/pilot/phase-1-integration-agent-2026-05-16-rerun \
+  --codex-timeout-seconds 900
+```
+
+Result: all three generated submissions passed OR-CI with classification
+`SUCCESS`; `original_solver_status`, `cost_scaling`, and
+`constraint_relaxation` passed for every problem.
 
 ## Assumptions
 

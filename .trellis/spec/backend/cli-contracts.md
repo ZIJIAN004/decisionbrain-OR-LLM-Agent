@@ -33,6 +33,13 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 - `agent` mode launches one persisted noninteractive `codex exec` session per
   BWOR id. Use `codex -a <policy> exec ...`, because approval is a top-level
   Codex flag on the local CLI.
+- `agent` mode must use a neutral Codex work directory, not the OR-CI repository
+  or requested artifact directory, as the `-C` path. Local `codex exec` can
+  no-op with `input_tokens=0` when `-C` points inside the OR-CI tree.
+- `agent` mode passes the requested artifact directory with `--add-dir`. If the
+  nested Codex sandbox cannot write absolute artifact paths directly, it writes
+  equivalent relative files under the neutral work directory and the parent CLI
+  harvests them into the requested artifact directory after `codex exec` exits.
 - `agent` mode writes JSON events with `codex exec --json` and the final agent
   message with `--output-last-message`.
 - Provider environment keys are `OPENAI_API_KEY` and optional
@@ -65,6 +72,7 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 | Agent mode requested | `health --agent` checks `codex --help`, `codex exec --help`, Gurobi, and OR-CI without checking provider keys. |
 | Nested Codex exits nonzero | Record `agent_returncode`, keep any produced artifacts, and let parent OR-CI verification classify the submission. |
 | Nested Codex times out | Terminate the nested process, record return code `124` and `timed_out=true`, and still write raw/status artifacts. |
+| Nested Codex writes fallback artifacts in the neutral work dir | Parent CLI copies `submissions/`, `reports/`, `agent-status/`, and `sessions/` files into the requested artifact directory before classifying generation. |
 | Nested Codex writes no submission | Write a stub submission, record `agent_failed`, and still produce raw/status artifacts. |
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
@@ -86,6 +94,8 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 ### 6. Tests Required
 
 - Run `uv run python -m compileall src/or_llm_agent` after CLI code changes.
+- Run `uv run python -m unittest tests.test_codex_agent` after agent-mode code
+  changes.
 - Run `uv run or-llm-agent --help` to verify the console entry point.
 - Run `uv run or-llm-agent health --model <model>` for static local readiness.
 - Run `uv run or-llm-agent health --model <model> --live` when checking provider
