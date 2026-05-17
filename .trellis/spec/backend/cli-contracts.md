@@ -17,11 +17,15 @@ other agents that produce OR-CI submissions from BWOR problems.
 ```bash
 uv run or-llm-agent health --model <model> [--live]
 uv run or-llm-agent health --agent
+uv run or-llm-agent spec --mode agent --statement-file <problem.txt> --problem-id <ID> --out <problem.json> --raw <raw.txt> [--status <status.json>] [--artifact-dir <dir>]
 uv run or-llm-agent generate --mode api --bwor-id <BWOR-ID> --model <model> --out <submission.py> --raw <raw.txt>
 uv run or-llm-agent generate --mode agent --bwor-id <BWOR-ID> --out <submission.py> --raw <raw.txt> [--artifact-dir <dir>]
+uv run or-llm-agent generate --mode agent --problem <problem.json> --statement-file <problem.txt> --out <submission.py> --raw <raw.txt> [--artifact-dir <dir>]
 uv run or-llm-agent verify --problem <problem.json> --submission <submission.py> --out <report.json>
 uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
+uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
+uv run or-ci validate-spec --problem <problem.json>
 ```
 
 ### 3. Contracts
@@ -50,8 +54,22 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 - `generate` reads BWOR question text from `data/datasets/bwor.jsonl` and OR-CI
   metadata from `../or-ci/tests/fixtures/bwor/<BWOR-ID>/problem.json` unless
   flags override the paths.
+- `spec` is the statement-to-ProblemSpec producer. V1 supports agent mode first:
+  nested Codex returns one JSON object, the parent CLI writes raw text and
+  extracted `problem.json`, then calls `or-ci validate-spec`.
+- `generate --problem` loads the explicit OR-CI metadata path instead of a BWOR
+  fixture. `--statement-file` supplies natural-language context to the model but
+  does not change OR-CI verification semantics.
+- `solve` writes `spec/`, `submissions/`, `reports/`, `raw/`, `sessions/`, and
+  `summary.json` under `--artifact-dir`. Its summary separates
+  `spec_generation_status`, `spec_validation_status`,
+  `model_generation_status`, and `verification_status`.
+- Generated specs are run artifacts until reviewed. Do not treat a generated
+  `problem.json` as benchmark ground truth.
 - Generated submissions must be extracted from fenced Python code blocks and
   expose `def build_model(data: dict)`.
+- Generated specs must be extracted as a single JSON object and validated with
+  OR-CI metadata validation before any model generation.
 - `verify` runs OR-CI out of process and writes the OR-CI report JSON unchanged.
   If the `or-ci` console script is unavailable, use `python -m or_ci.cli` as the
   out-of-process fallback.
@@ -76,6 +94,8 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 | Nested Codex writes no submission | Write a stub submission, record `agent_failed`, and still produce raw/status artifacts. |
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
+| Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |
+| `or-ci validate-spec` rejects generated metadata | `spec` records `spec_validation_status=failed`; `solve` stops before model generation. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
 
@@ -83,8 +103,14 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 
 - Good: `pilot` completes with at least one generated or reused submission and
   reports each OR-CI classification in `summary.json`.
+- Good: `spec` writes raw output, extracted `problem.json`, status JSON, and
+  `spec_validation_status=passed`.
+- Good: `solve` reaches OR-CI verification and reports `PASS` as "passed
+  generated spec", not as proof that the source statement was fully modeled.
 - Base: provider credentials are invalid; `pilot` still writes the full artifact
   tree with redacted errors and failed generation statuses.
+- Base: generated ProblemSpec fails OR-CI metadata validation; `solve` writes
+  `summary.json` and skips model generation.
 - Base: nested Codex exits nonzero; `pilot --mode agent` still writes
   `codex-events.jsonl`, `last-message.md` if available, raw/status JSON, the
   parent OR-CI report, `summary.json`, and `report.md`.
@@ -97,6 +123,15 @@ uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [
 - Run `uv run python -m unittest tests.test_codex_agent` after agent-mode code
   changes.
 - Run `uv run or-llm-agent --help` to verify the console entry point.
+- Run `uv run or-llm-agent spec --help`, `generate --help`, and `solve --help`
+  after changing parser flags.
+- Run `uv run or-ci validate-spec --problem tests/fixtures/bwor/BWOR-001/problem.json`
+  from the OR-CI repo, or `uv run python -m or_ci.cli validate-spec --problem ...`
+  from this repo when the console script is unavailable.
+- Add tests that `spec` writes `problem.json`, raw output, and status JSON from
+  a mocked valid agent result.
+- Add tests that `solve` stops before model generation when spec validation
+  fails.
 - Run `uv run or-llm-agent health --model <model>` for static local readiness.
 - Run `uv run or-llm-agent health --model <model> --live` when checking provider
   credentials or redaction behavior.
@@ -130,3 +165,19 @@ result = subprocess.run([*command, "verify", ...], capture_output=True, text=Tru
 
 Keep the verifier out of process, capture stdout/stderr for redaction, and let
 the caller summarize failures deterministically.
+
+#### Wrong
+
+```python
+summary["verification_note"] = "proved original statement correct"
+```
+
+This overclaims what OR-CI verified when the spec itself was generated.
+
+#### Correct
+
+```python
+summary["verification_note"] = "passed generated spec"
+```
+
+Keep source-statement fidelity separate from generated-spec verification.

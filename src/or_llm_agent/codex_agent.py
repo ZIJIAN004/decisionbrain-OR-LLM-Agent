@@ -55,7 +55,7 @@ def build_agent_paths(
     root = artifact_root.resolve()
     return CodexAgentPaths(
         artifact_root=root,
-        work_dir=_neutral_work_dir(root, problem_id),
+        work_dir=neutral_work_dir(root, problem_id),
         session_dir=root / "sessions" / problem_id,
         events_path=root / "sessions" / problem_id / "codex-events.jsonl",
         last_message_path=root / "sessions" / problem_id / "last-message.md",
@@ -64,6 +64,11 @@ def build_agent_paths(
         raw_path=(raw_path or root / "raw" / f"{problem_id}.txt").resolve(),
         status_path=(root / "agent-status" / f"{problem_id}.json").resolve(),
     )
+
+
+def neutral_work_dir(artifact_root: Path, problem_id: str) -> Path:
+    root_hash = hashlib.sha256(str(artifact_root).encode("utf-8")).hexdigest()[:16]
+    return Path.home() / ".cache" / "or_llm_agent" / "codex-work" / root_hash / problem_id
 
 
 def run_codex_agent(
@@ -280,8 +285,7 @@ Start now. Complete the workflow without asking for confirmation.
 
 
 def _neutral_work_dir(artifact_root: Path, problem_id: str) -> Path:
-    root_hash = hashlib.sha256(str(artifact_root).encode("utf-8")).hexdigest()[:16]
-    return Path.home() / ".cache" / "or_llm_agent" / "codex-work" / root_hash / problem_id
+    return neutral_work_dir(artifact_root, problem_id)
 
 
 def _harvest_work_dir_artifacts(paths: CodexAgentPaths) -> list[str]:

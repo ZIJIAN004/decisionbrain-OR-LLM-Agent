@@ -49,6 +49,17 @@ class VerificationResult:
         ]
 
 
+@dataclass
+class SpecValidationResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def status(self) -> str:
+        return "passed" if self.returncode == 0 else "failed"
+
+
 def run_or_ci_verify(
     *,
     problem_path: Path,
@@ -84,6 +95,27 @@ def run_or_ci_verify(
         stdout=redact_text(result.stdout),
         stderr=redact_text(result.stderr),
         report=report,
+    )
+
+
+def run_or_ci_validate_spec(*, problem_path: Path, cwd: Path | None = None) -> SpecValidationResult:
+    command, _ = or_ci_command()
+    result = subprocess.run(
+        [
+            *command,
+            "validate-spec",
+            "--problem",
+            str(problem_path),
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return SpecValidationResult(
+        returncode=result.returncode,
+        stdout=redact_text(result.stdout),
+        stderr=redact_text(result.stderr),
     )
 
 
