@@ -75,6 +75,8 @@ def _main(argv: list[str] | None = None) -> int:
         return pilot_command(args)
     if args.command == "solve":
         return solve_command(args)
+    if args.command == "solve-batch":
+        return solve_batch_command(args)
     parser.print_help()
     return 2
 
@@ -136,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--model", default="o3-mini")
     solve.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
     _add_agent_options(solve)
+
+    solve_batch = subparsers.add_parser("solve-batch", help="run statement-to-spec-to-model solves for a batch")
+    solve_batch.add_argument("--mode", choices=("agent",), default="agent")
+    solve_batch.add_argument("--ids", required=True, nargs="+")
+    solve_batch.add_argument("--artifact-dir", required=True, type=Path)
+    solve_batch.add_argument("--statements-dir", type=Path, help="directory containing <problem-id>.txt statement files")
+    solve_batch.add_argument("--dataset", default=default_bwor_dataset(), type=Path)
+    solve_batch.add_argument("--model", default="o3-mini")
+    solve_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    _add_agent_options(solve_batch)
     return parser
 
 
@@ -330,6 +342,7 @@ def solve_command(args: argparse.Namespace) -> int:
     spec_raw_path = raw_dir / "spec.txt"
     spec_status_path = spec_dir / "status.json"
     spec_fidelity_review_path = spec_dir / "fidelity-review.md"
+    spec_fidelity_report_path = spec_dir / "fidelity-review.json"
     spec_result = generate_problem_spec(
         problem_id=args.problem_id,
         statement=statement,
@@ -354,6 +367,7 @@ def solve_command(args: argparse.Namespace) -> int:
         "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
         "spec_fidelity_status": "not_reviewed",
         "spec_fidelity_review": _relative(spec_fidelity_review_path, artifact_dir),
+        "spec_fidelity_report": _relative(spec_fidelity_report_path, artifact_dir),
         "model_generation_status": "skipped",
         "verification_status": "skipped",
         "classification": "skipped",
@@ -361,7 +375,13 @@ def solve_command(args: argparse.Namespace) -> int:
 
     if not _spec_is_ready(spec_result):
         summary["reason"] = "spec validation failed; model generation skipped"
-        _write_spec_fidelity_review(spec_fidelity_review_path, summary=summary, statement=statement)
+        _write_spec_fidelity_review(
+            spec_fidelity_review_path,
+            report_path=spec_fidelity_report_path,
+            summary=summary,
+            statement=statement,
+            problem_path=problem_path,
+        )
         _write_summary(artifact_dir / "summary.json", summary)
         print(f"{args.problem_id}: spec_validation={summary['spec_validation_status']} model_generation=skipped")
         return 1
@@ -407,7 +427,13 @@ def solve_command(args: argparse.Namespace) -> int:
             "verify_stderr": verification.stderr,
         }
     )
-    _write_spec_fidelity_review(spec_fidelity_review_path, summary=summary, statement=statement)
+    _write_spec_fidelity_review(
+        spec_fidelity_review_path,
+        report_path=spec_fidelity_report_path,
+        summary=summary,
+        statement=statement,
+        problem_path=problem_path,
+    )
     _write_summary(artifact_dir / "summary.json", summary)
     print(
         f"{args.problem_id}: spec_validation={summary['spec_validation_status']} "
@@ -415,6 +441,37 @@ def solve_command(args: argparse.Namespace) -> int:
         f"classification={summary['classification']}"
     )
     return 0 if generation["generation_status"] == "generated" and verification.returncode == 0 else 1
+
+
+def solve_batch_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, Any]] = []
+    for problem_id in args.ids:
+        statement_path = _batch_statement_file(args, artifact_dir, problem_id)
+        case_dir = artifact_dir / problem_id
+        solve_args = argparse.Namespace(**vars(args))
+        solve_args.command = "solve"
+        solve_args.problem_id = problem_id
+        solve_args.statement_file = statement_path
+        solve_args.artifact_dir = case_dir
+        exit_code = solve_command(solve_args)
+        row = _solve_batch_row(
+            problem_id=problem_id,
+            exit_code=exit_code,
+            artifact_dir=artifact_dir,
+            case_dir=case_dir,
+            statement_path=statement_path,
+        )
+        rows.append(row)
+
+    summary = summarize_solve_batch(rows)
+    payload = {"summary": summary, "rows": rows}
+    _write_summary(artifact_dir / "summary.json", payload)
+    write_solve_batch_report(artifact_dir / "report.md", args, summary, rows)
+    print(f"wrote {artifact_dir / 'report.md'}")
+    return 0 if all(row["exit_code"] == 0 for row in rows) else 1
 
 
 def generate_problem_spec(
@@ -662,6 +719,32 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    classifications: dict[str, int] = {}
+    spec_statuses: dict[str, int] = {}
+    model_statuses: dict[str, int] = {}
+    fidelity_gate_statuses: dict[str, int] = {}
+    exit_codes: dict[str, int] = {}
+    for row in rows:
+        classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
+        spec_statuses[row["spec_validation_status"]] = spec_statuses.get(row["spec_validation_status"], 0) + 1
+        model_statuses[row["model_generation_status"]] = model_statuses.get(row["model_generation_status"], 0) + 1
+        gate = row.get("spec_fidelity_gate_status", "unknown")
+        fidelity_gate_statuses[gate] = fidelity_gate_statuses.get(gate, 0) + 1
+        exit_key = str(row["exit_code"])
+        exit_codes[exit_key] = exit_codes.get(exit_key, 0) + 1
+    return {
+        "total": len(rows),
+        "succeeded": sum(1 for row in rows if row["exit_code"] == 0),
+        "failed": sum(1 for row in rows if row["exit_code"] != 0),
+        "classifications": classifications,
+        "spec_validation_statuses": spec_statuses,
+        "model_generation_statuses": model_statuses,
+        "spec_fidelity_gate_statuses": fidelity_gate_statuses,
+        "exit_codes": exit_codes,
+    }
+
+
 def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     matrix = [
         "| Problem | Mode | Generation | Agent RC | OR-CI Classification | Failure Check | Submission | Report |",
@@ -718,6 +801,109 @@ def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[st
 """,
         encoding="utf-8",
     )
+
+
+def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    matrix = [
+        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity Gate | Artifact |",
+        "|---|---:|---|---:|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        matrix.append(
+            f"| {row['problem_id']} | `{row['exit_code']}` | `{row['spec_validation_status']}` | "
+            f"`{row['spec_attempt_count']}` | `{row['spec_repair_status']}` | "
+            f"`{row['model_generation_status']}` | `{row['verification_status']}` | "
+            f"`{row['classification']}` | `{row.get('spec_fidelity_gate_status', 'unknown')}` | "
+            f"`{row['artifact_dir']}` |"
+        )
+
+    path.write_text(
+        f"""# Statement-Only Solve Batch Report
+
+## Scope
+
+- Producer: `or_llm_agent solve-batch --mode {args.mode}`
+- Problems: {", ".join(args.ids)}
+- Source: `--statements-dir` if supplied, otherwise `--dataset`
+
+## Summary
+
+```json
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+```
+
+## Matrix
+
+{chr(10).join(matrix)}
+
+## Interpretation Notes
+
+- `classification=SUCCESS` means the generated submission passed OR-CI checks against the generated spec.
+- `spec_fidelity_gate_status=manual_review_required` means source-statement fidelity has not been certified.
+- Inspect each case's `spec/fidelity-review.md` and `spec/fidelity-review.json` before treating generated specs as benchmark metadata.
+""",
+        encoding="utf-8",
+    )
+
+
+def _batch_statement_file(args: argparse.Namespace, artifact_dir: Path, problem_id: str) -> Path:
+    if args.statements_dir:
+        candidate = args.statements_dir / f"{problem_id}.txt"
+        if candidate.is_file():
+            return candidate
+
+    record = load_bwor_record(args.dataset, problem_id)
+    statement = record.get("en_question") or record.get("cn_question")
+    if not isinstance(statement, str) or not statement.strip():
+        raise CLIError(f"no statement text found for {problem_id} in {args.dataset}")
+    statement_path = artifact_dir / "statements" / f"{problem_id}.txt"
+    statement_path.parent.mkdir(parents=True, exist_ok=True)
+    statement_path.write_text(statement.strip() + "\n", encoding="utf-8")
+    return statement_path
+
+
+def _solve_batch_row(
+    *,
+    problem_id: str,
+    exit_code: int,
+    artifact_dir: Path,
+    case_dir: Path,
+    statement_path: Path,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "problem_id": problem_id,
+        "exit_code": exit_code,
+        "artifact_dir": _relative(case_dir, artifact_dir),
+        "statement_file": _relative(statement_path, artifact_dir),
+        "spec_validation_status": "missing_summary",
+        "spec_attempt_count": 0,
+        "spec_repair_status": "missing_summary",
+        "model_generation_status": "missing_summary",
+        "verification_status": "missing_summary",
+        "classification": "missing_summary",
+    }
+    summary_path = case_dir / "summary.json"
+    if not summary_path.is_file():
+        return row
+    case_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    for key in (
+        "spec_validation_status",
+        "spec_attempt_count",
+        "spec_repair_status",
+        "spec_fidelity_status",
+        "spec_fidelity_gate_status",
+        "model_generation_status",
+        "verification_status",
+        "classification",
+        "spec",
+        "spec_fidelity_review",
+        "spec_fidelity_report",
+        "submission",
+        "report",
+    ):
+        if key in case_summary:
+            row[key] = case_summary[key]
+    return row
 
 
 def _generation_inputs_from_args(args: argparse.Namespace) -> GenerationInputs:
@@ -941,11 +1127,32 @@ def _spec_is_ready(result: dict[str, Any]) -> bool:
     return result.get("spec_generation_status") == "generated" and result.get("spec_validation_status") == "passed"
 
 
-def _write_spec_fidelity_review(path: Path, *, summary: dict[str, Any], statement: str) -> None:
+def _write_spec_fidelity_review(
+    path: Path,
+    *,
+    report_path: Path,
+    summary: dict[str, Any],
+    statement: str,
+    problem_path: Path,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    fidelity = _build_spec_fidelity_payload(summary=summary, statement=statement, problem_path=problem_path)
+    summary["spec_fidelity_gate_status"] = fidelity["gate_status"]
+    summary["spec_fidelity_risk_flags"] = [flag["code"] for flag in fidelity["risk_flags"]]
+    report_path.write_text(json.dumps(fidelity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
     statement_excerpt = statement.replace("\r\n", "\n").strip()
     if len(statement_excerpt) > 800:
         statement_excerpt = statement_excerpt[:797].rstrip() + "..."
+    check_lines = [
+        f"- `{check['status']}` {check['name']}: {check['detail']}"
+        for check in fidelity["automatic_checks"]
+    ]
+    risk_lines = [
+        f"- `{flag['severity']}` {flag['code']}: {flag['message']}"
+        for flag in fidelity["risk_flags"]
+    ] or ["- None detected by automatic checks."]
 
     path.write_text(
         f"""# ProblemSpec Fidelity Review
@@ -962,12 +1169,22 @@ def _write_spec_fidelity_review(path: Path, *, summary: dict[str, Any], statemen
 - Verification: `{summary['verification_status']}`
 - Classification: `{summary['classification']}`
 - Fidelity status: `{summary['spec_fidelity_status']}`
+- Fidelity gate: `{summary['spec_fidelity_gate_status']}`
+- Structured report: `{summary['spec_fidelity_report']}`
 
 ## Statement Excerpt
 
 ```text
 {statement_excerpt}
 ```
+
+## Automatic Checks
+
+{chr(10).join(check_lines)}
+
+## Risk Flags
+
+{chr(10).join(risk_lines)}
 
 ## Manual Checklist
 
@@ -984,6 +1201,113 @@ TODO
 """,
         encoding="utf-8",
     )
+
+
+def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, problem_path: Path) -> dict[str, Any]:
+    problem = _read_json_object(problem_path)
+    gate_status = "manual_review_required" if summary.get("spec_validation_status") == "passed" else "blocked_spec_invalid"
+    automatic_checks = [
+        {
+            "name": "or_ci_spec_validation",
+            "status": "PASS" if summary.get("spec_validation_status") == "passed" else "FAIL",
+            "detail": f"spec_validation_status={summary.get('spec_validation_status')}",
+        },
+        {
+            "name": "model_verified_against_generated_spec",
+            "status": _fidelity_check_status(summary.get("verification_status")),
+            "detail": f"verification_status={summary.get('verification_status')}",
+        },
+        {
+            "name": "source_statement_fidelity",
+            "status": "PENDING",
+            "detail": "manual review is required before treating generated spec as ground truth",
+        },
+    ]
+    return {
+        "problem_id": summary["problem_id"],
+        "gate_status": gate_status,
+        "fidelity_status": summary["spec_fidelity_status"],
+        "statement_file": summary["statement_file"],
+        "statement_excerpt": statement[:800],
+        "spec": summary["spec"],
+        "spec_validation_status": summary["spec_validation_status"],
+        "model_generation_status": summary["model_generation_status"],
+        "verification_status": summary["verification_status"],
+        "classification": summary["classification"],
+        "automatic_checks": automatic_checks,
+        "risk_flags": _spec_fidelity_risk_flags(problem),
+        "manual_checklist": [
+            "sets and indices match the statement",
+            "numeric parameters match the statement",
+            "objective direction and coefficients match the statement",
+            "constraint families and bounds match the statement",
+            "metamorphic paths touch objective and constraint data paths where available",
+            "OR-CI result is interpreted only against the generated spec",
+        ],
+    }
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _fidelity_check_status(verification_status: Any) -> str:
+    if verification_status == "PASS":
+        return "PASS"
+    if verification_status == "skipped":
+        return "SKIP"
+    return "FAIL"
+
+
+def _spec_fidelity_risk_flags(problem: dict[str, Any]) -> list[dict[str, str]]:
+    instance = problem.get("instance") if isinstance(problem.get("instance"), dict) else {}
+    metamorphic = problem.get("metamorphic") if isinstance(problem.get("metamorphic"), dict) else {}
+    cost_scaling = metamorphic.get("cost_scaling") if isinstance(metamorphic.get("cost_scaling"), dict) else {}
+    coefficient_paths = cost_scaling.get("coefficient_paths") if isinstance(cost_scaling.get("coefficient_paths"), list) else []
+    searchable = " ".join([*(_flatten_keys(instance)), *(str(path) for path in coefficient_paths)]).lower()
+    flags: list[dict[str, str]] = []
+    has_profit = "profit" in searchable or "revenue" in searchable
+    has_cost = "cost" in searchable or "price" in searchable
+    has_derived_net = "net" in searchable or "benefit" in searchable
+    if has_derived_net and not (has_profit and has_cost):
+        flags.append(
+            {
+                "code": "derived_objective_without_primitives",
+                "severity": "warning",
+                "message": "objective data appears derived; preserve primitive profit/revenue and cost fields when available",
+            }
+        )
+    if "constraint_relaxation" not in metamorphic:
+        flags.append(
+            {
+                "code": "no_constraint_relaxation",
+                "severity": "warning",
+                "message": "metadata has no configured constraint relaxation check",
+            }
+        )
+    return flags
+
+
+def _flatten_keys(value: Any, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        keys: list[str] = []
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            keys.append(child)
+            keys.extend(_flatten_keys(item, child))
+        return keys
+    if isinstance(value, list):
+        keys = []
+        for index, item in enumerate(value):
+            keys.extend(_flatten_keys(item, f"{prefix}[{index}]"))
+        return keys
+    return []
 
 
 def _write_summary(path: Path, payload: dict[str, Any]) -> None:

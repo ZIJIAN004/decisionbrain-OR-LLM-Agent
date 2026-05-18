@@ -25,6 +25,7 @@ uv run or-llm-agent verify --problem <problem.json> --submission <submission.py>
 uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
+uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>]
 uv run or-ci validate-spec --problem <problem.json>
 ```
 
@@ -64,12 +65,22 @@ uv run or-ci validate-spec --problem <problem.json>
   `summary.json` under `--artifact-dir`. Its summary separates
   `spec_generation_status`, `spec_validation_status`,
   `model_generation_status`, and `verification_status`.
+- `solve` writes `spec/fidelity-review.md` plus `spec/fidelity-review.json`.
+  These are source-statement fidelity review gates, not proof artifacts. The
+  default gate status is `manual_review_required` for valid specs and
+  `blocked_spec_invalid` when metadata validation fails.
+- `solve-batch` runs statement-only `solve` once per id under
+  `<artifact-dir>/<ID>/`, writes any dataset-sourced statement text to
+  `<artifact-dir>/statements/<ID>.txt`, and writes aggregate `summary.json` and
+  `report.md` at the batch root.
 - Generated specs are run artifacts until reviewed. Do not treat a generated
   `problem.json` as benchmark ground truth.
 - Generated submissions must be extracted from fenced Python code blocks and
   expose `def build_model(data: dict)`.
 - Generated specs must be extracted as a single JSON object and validated with
-  OR-CI metadata validation before any model generation.
+  OR-CI metadata validation before any model generation. If validation fails,
+  `spec`/`solve` may run a bounded repair loop using the OR-CI validation error
+  and previous JSON as repair context.
 - `verify` runs OR-CI out of process and writes the OR-CI report JSON unchanged.
   If the `or-ci` console script is unavailable, use `python -m or_ci.cli` as the
   out-of-process fallback.
@@ -95,7 +106,7 @@ uv run or-ci validate-spec --problem <problem.json>
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
 | Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |
-| `or-ci validate-spec` rejects generated metadata | `spec` records `spec_validation_status=failed`; `solve` stops before model generation. |
+| `or-ci validate-spec` rejects generated metadata | `spec` records the failed attempt and retries up to `--max-repair-attempts`; if still failed, `solve` stops before model generation. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
 
@@ -107,10 +118,14 @@ uv run or-ci validate-spec --problem <problem.json>
   `spec_validation_status=passed`.
 - Good: `solve` reaches OR-CI verification and reports `PASS` as "passed
   generated spec", not as proof that the source statement was fully modeled.
+- Good: `solve-batch` writes one case directory per id, an aggregate
+  `summary.json`, and a `report.md` that lists spec validation, model
+  generation, OR-CI classification, and fidelity gate status per case.
 - Base: provider credentials are invalid; `pilot` still writes the full artifact
   tree with redacted errors and failed generation statuses.
 - Base: generated ProblemSpec fails OR-CI metadata validation; `solve` writes
-  `summary.json` and skips model generation.
+  `summary.json`, writes blocked fidelity artifacts, and skips model generation
+  after repair attempts are exhausted.
 - Base: nested Codex exits nonzero; `pilot --mode agent` still writes
   `codex-events.jsonl`, `last-message.md` if available, raw/status JSON, the
   parent OR-CI report, `summary.json`, and `report.md`.
@@ -125,6 +140,7 @@ uv run or-ci validate-spec --problem <problem.json>
 - Run `uv run or-llm-agent --help` to verify the console entry point.
 - Run `uv run or-llm-agent spec --help`, `generate --help`, and `solve --help`
   after changing parser flags.
+- Run `uv run or-llm-agent solve-batch --help` after changing batch parser flags.
 - Run `uv run or-ci validate-spec --problem tests/fixtures/bwor/BWOR-001/problem.json`
   from the OR-CI repo, or `uv run python -m or_ci.cli validate-spec --problem ...`
   from this repo when the console script is unavailable.
@@ -132,6 +148,8 @@ uv run or-ci validate-spec --problem <problem.json>
   a mocked valid agent result.
 - Add tests that `solve` stops before model generation when spec validation
   fails.
+- Add tests that `solve-batch` writes an aggregate summary/report from mocked
+  per-case solves.
 - Run `uv run or-llm-agent health --model <model>` for static local readiness.
 - Run `uv run or-llm-agent health --model <model> --live` when checking provider
   credentials or redaction behavior.
