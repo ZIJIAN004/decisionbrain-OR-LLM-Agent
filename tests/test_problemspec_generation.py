@@ -341,10 +341,158 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(batch["summary"]["total"], 2)
             self.assertEqual(batch["summary"]["succeeded"], 2)
+            self.assertEqual(batch["summary"]["spec_fidelity_statuses"]["not_reviewed"], 2)
             self.assertEqual(batch["summary"]["spec_fidelity_gate_statuses"]["manual_review_required"], 2)
             self.assertEqual(len(batch["rows"]), 2)
             self.assertTrue((artifact_dir / "report.md").exists())
             self.assertTrue((artifact_dir / "CASE-001" / "spec" / "fidelity-review.json").exists())
+
+    def test_review_fidelity_accepts_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+
+            exit_code = main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "accepted",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Numbers and constraints match the statement.",
+                    "--evidence",
+                    "manual checklist",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "accepted")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "accepted")
+            self.assertEqual(summary["spec_fidelity_reviewed_by"], "unit-test")
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["fidelity_status"], "accepted")
+            self.assertEqual(report["gate_status"], "accepted")
+            self.assertEqual(report["review"]["status"], "accepted")
+            self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
+            review = (artifact_dir / "spec" / "fidelity-review.md").read_text(encoding="utf-8")
+            self.assertIn("## Review Decision", review)
+            self.assertIn("Status: `accepted`", review)
+
+    def test_review_fidelity_rejects_case_even_when_verification_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir, verification=VerificationResult(1, "", "", None))
+
+            exit_code = main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "rejected",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Verification did not pass.",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "rejected")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "rejected")
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["automatic_checks"][2]["status"], "FAIL")
+
+    def test_review_fidelity_does_not_accept_failed_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir, verification=VerificationResult(1, "", "", None))
+
+            exit_code = main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "accepted",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Should fail.",
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "not_reviewed")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "manual_review_required")
+
+    def test_review_fidelity_batch_updates_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+            statements_dir = artifact_dir / "statements"
+            statements_dir.mkdir(parents=True)
+            for problem_id in ("CASE-001", "CASE-002"):
+                _write_solved_case(
+                    root,
+                    statements_dir / f"{problem_id}.txt",
+                    artifact_dir / problem_id,
+                    problem_id=problem_id,
+                )
+            rows = [
+                {
+                    "problem_id": problem_id,
+                    "exit_code": 0,
+                    "artifact_dir": problem_id,
+                    "statement_file": f"statements/{problem_id}.txt",
+                    "spec_validation_status": "passed",
+                    "spec_attempt_count": 1,
+                    "spec_repair_status": "not_needed",
+                    "model_generation_status": "generated",
+                    "verification_status": "PASS",
+                    "classification": "SUCCESS",
+                    "spec_fidelity_status": "not_reviewed",
+                    "spec_fidelity_gate_status": "manual_review_required",
+                }
+                for problem_id in ("CASE-001", "CASE-002")
+            ]
+            (artifact_dir / "summary.json").write_text(
+                json.dumps({"summary": {"total": 2}, "rows": rows}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            exit_code = main(
+                [
+                    "review-fidelity-batch",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "accepted",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Manual batch review accepted.",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch["summary"]["spec_fidelity_statuses"]["accepted"], 2)
+            self.assertEqual(batch["summary"]["spec_fidelity_gate_statuses"]["accepted"], 2)
+            self.assertEqual(batch["rows"][0]["spec_fidelity_status"], "accepted")
+            self.assertIn("accepted", (artifact_dir / "report.md").read_text(encoding="utf-8"))
 
 
 def _agent_result(root: Path, payload: dict) -> ProblemSpecAgentResult:
@@ -356,6 +504,61 @@ def _agent_result(root: Path, payload: dict) -> ProblemSpecAgentResult:
         last_message_path=root / "last-message.md",
         stderr="",
     )
+
+
+def _write_solved_case(
+    root: Path,
+    statement_path: Path,
+    artifact_dir: Path,
+    *,
+    problem_id: str = "CASE-001",
+    verification: VerificationResult | None = None,
+) -> None:
+    statement_path.parent.mkdir(parents=True, exist_ok=True)
+    statement_path.write_text(f"Statement for {problem_id}.", encoding="utf-8")
+    verification = verification or VerificationResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+        report={"classification": "SUCCESS", "status": "PASS", "checks": []},
+    )
+
+    def fake_generate_agent_submission(inputs, paths, args):
+        paths.submission_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.raw_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.submission_path.write_text("def build_model(data):\n    return None\n", encoding="utf-8")
+        paths.raw_path.write_text("generated model", encoding="utf-8")
+        return {
+            "generation_status": "generated",
+            "generation_error": "",
+            "raw_response": paths.raw_path,
+            "submission": paths.submission_path,
+            "generation_mode": "agent",
+            "agent_returncode": 0,
+            "agent_timed_out": False,
+        }
+
+    with (
+        patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem(problem_id))),
+        patch("or_llm_agent.cli.generate_agent_submission", fake_generate_agent_submission),
+        patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
+    ):
+        exit_code = main(
+            [
+                "solve",
+                "--mode",
+                "agent",
+                "--statement-file",
+                str(statement_path),
+                "--problem-id",
+                problem_id,
+                "--artifact-dir",
+                str(artifact_dir),
+            ]
+        )
+    expected = 0 if verification.returncode == 0 else 1
+    if exit_code != expected:
+        raise AssertionError(f"unexpected solve exit code: {exit_code}")
 
 
 def _valid_problem(problem_id: str = "CASE-001") -> dict:

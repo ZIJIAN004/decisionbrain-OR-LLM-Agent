@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,10 @@ def _main(argv: list[str] | None = None) -> int:
         return solve_command(args)
     if args.command == "solve-batch":
         return solve_batch_command(args)
+    if args.command == "review-fidelity":
+        return review_fidelity_command(args)
+    if args.command == "review-fidelity-batch":
+        return review_fidelity_batch_command(args)
     parser.print_help()
     return 2
 
@@ -148,6 +153,21 @@ def build_parser() -> argparse.ArgumentParser:
     solve_batch.add_argument("--model", default="o3-mini")
     solve_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
     _add_agent_options(solve_batch)
+
+    review = subparsers.add_parser("review-fidelity", help="record a manual source-statement fidelity review")
+    review.add_argument("--artifact-dir", required=True, type=Path, help="single solve artifact directory")
+    review.add_argument("--status", required=True, choices=("accepted", "rejected"))
+    review.add_argument("--reviewer", required=True)
+    review.add_argument("--note", required=True)
+    review.add_argument("--evidence", action="append", default=[])
+
+    review_batch = subparsers.add_parser("review-fidelity-batch", help="record fidelity reviews for a solve-batch")
+    review_batch.add_argument("--artifact-dir", required=True, type=Path, help="solve-batch artifact directory")
+    review_batch.add_argument("--ids", nargs="+")
+    review_batch.add_argument("--status", required=True, choices=("accepted", "rejected"))
+    review_batch.add_argument("--reviewer", required=True)
+    review_batch.add_argument("--note", required=True)
+    review_batch.add_argument("--evidence", action="append", default=[])
     return parser
 
 
@@ -474,6 +494,43 @@ def solve_batch_command(args: argparse.Namespace) -> int:
     return 0 if all(row["exit_code"] == 0 for row in rows) else 1
 
 
+def review_fidelity_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    review = _review_payload(args)
+    summary = apply_fidelity_review(artifact_dir=artifact_dir, review=review)
+    print(
+        f"{summary['problem_id']}: spec_fidelity_status={summary['spec_fidelity_status']} "
+        f"gate={summary['spec_fidelity_gate_status']}"
+    )
+    return 0
+
+
+def review_fidelity_batch_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    ids = args.ids or _batch_ids_from_summary(artifact_dir)
+    review = _review_payload(args)
+    for problem_id in ids:
+        apply_fidelity_review(artifact_dir=artifact_dir / problem_id, review=review)
+
+    rows = [
+        _solve_batch_row(
+            problem_id=problem_id,
+            exit_code=_case_exit_code(artifact_dir / problem_id),
+            artifact_dir=artifact_dir,
+            case_dir=artifact_dir / problem_id,
+            statement_path=artifact_dir / "statements" / f"{problem_id}.txt",
+        )
+        for problem_id in ids
+    ]
+    summary = summarize_solve_batch(rows)
+    payload = {"summary": summary, "rows": rows}
+    _write_summary(artifact_dir / "summary.json", payload)
+    report_args = argparse.Namespace(ids=ids, mode="agent")
+    write_solve_batch_report(artifact_dir / "report.md", report_args, summary, rows)
+    print(f"reviewed {len(ids)} case(s); wrote {artifact_dir / 'report.md'}")
+    return 0
+
+
 def generate_problem_spec(
     *,
     problem_id: str,
@@ -723,12 +780,15 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     classifications: dict[str, int] = {}
     spec_statuses: dict[str, int] = {}
     model_statuses: dict[str, int] = {}
+    fidelity_statuses: dict[str, int] = {}
     fidelity_gate_statuses: dict[str, int] = {}
     exit_codes: dict[str, int] = {}
     for row in rows:
         classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
         spec_statuses[row["spec_validation_status"]] = spec_statuses.get(row["spec_validation_status"], 0) + 1
         model_statuses[row["model_generation_status"]] = model_statuses.get(row["model_generation_status"], 0) + 1
+        fidelity_status = row.get("spec_fidelity_status", "unknown")
+        fidelity_statuses[fidelity_status] = fidelity_statuses.get(fidelity_status, 0) + 1
         gate = row.get("spec_fidelity_gate_status", "unknown")
         fidelity_gate_statuses[gate] = fidelity_gate_statuses.get(gate, 0) + 1
         exit_key = str(row["exit_code"])
@@ -740,6 +800,7 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "classifications": classifications,
         "spec_validation_statuses": spec_statuses,
         "model_generation_statuses": model_statuses,
+        "spec_fidelity_statuses": fidelity_statuses,
         "spec_fidelity_gate_statuses": fidelity_gate_statuses,
         "exit_codes": exit_codes,
     }
@@ -805,15 +866,16 @@ def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[st
 
 def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     matrix = [
-        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity Gate | Artifact |",
-        "|---|---:|---|---:|---|---|---|---|---|---|",
+        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity | Gate | Artifact |",
+        "|---|---:|---|---:|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         matrix.append(
             f"| {row['problem_id']} | `{row['exit_code']}` | `{row['spec_validation_status']}` | "
             f"`{row['spec_attempt_count']}` | `{row['spec_repair_status']}` | "
             f"`{row['model_generation_status']}` | `{row['verification_status']}` | "
-            f"`{row['classification']}` | `{row.get('spec_fidelity_gate_status', 'unknown')}` | "
+            f"`{row['classification']}` | `{row.get('spec_fidelity_status', 'unknown')}` | "
+            f"`{row.get('spec_fidelity_gate_status', 'unknown')}` | "
             f"`{row['artifact_dir']}` |"
         )
 
@@ -840,6 +902,8 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
 
 - `classification=SUCCESS` means the generated submission passed OR-CI checks against the generated spec.
 - `spec_fidelity_gate_status=manual_review_required` means source-statement fidelity has not been certified.
+- `spec_fidelity_gate_status=accepted` means a reviewer accepted source-statement fidelity for this run artifact.
+- `spec_fidelity_gate_status=rejected` means a reviewer rejected source-statement fidelity for this run artifact.
 - Inspect each case's `spec/fidelity-review.md` and `spec/fidelity-review.json` before treating generated specs as benchmark metadata.
 """,
         encoding="utf-8",
@@ -892,6 +956,8 @@ def _solve_batch_row(
         "spec_repair_status",
         "spec_fidelity_status",
         "spec_fidelity_gate_status",
+        "spec_fidelity_reviewed_at",
+        "spec_fidelity_reviewed_by",
         "model_generation_status",
         "verification_status",
         "classification",
@@ -904,6 +970,193 @@ def _solve_batch_row(
         if key in case_summary:
             row[key] = case_summary[key]
     return row
+
+
+def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict[str, Any]:
+    summary_path = artifact_dir / "summary.json"
+    if not summary_path.is_file():
+        raise CLIError(f"solve summary does not exist: {summary_path}")
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not isinstance(summary, dict):
+        raise CLIError(f"solve summary must be a JSON object: {summary_path}")
+    if review["status"] == "accepted":
+        _ensure_acceptance_is_allowed(summary, artifact_dir)
+
+    review_path = _artifact_path(artifact_dir, summary.get("spec_fidelity_review"), "spec/fidelity-review.md")
+    report_path = _artifact_path(artifact_dir, summary.get("spec_fidelity_report"), "spec/fidelity-review.json")
+    report = _read_json_object(report_path)
+    report.update(
+        {
+            "problem_id": summary.get("problem_id"),
+            "fidelity_status": review["status"],
+            "gate_status": review["status"],
+            "review": review,
+        }
+    )
+    _update_source_fidelity_check(report, review)
+
+    summary.update(
+        {
+            "spec_fidelity_status": review["status"],
+            "spec_fidelity_gate_status": review["status"],
+            "spec_fidelity_reviewed_at": review["reviewed_at"],
+            "spec_fidelity_reviewed_by": review["reviewer"],
+            "spec_fidelity_review_note": review["note"],
+            "spec_fidelity_evidence": review["evidence"],
+        }
+    )
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_reviewed_fidelity_markdown(review_path, summary=summary, report=report, artifact_dir=artifact_dir)
+    _write_summary(summary_path, summary)
+    return summary
+
+
+def _review_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "mode": "manual",
+        "status": args.status,
+        "reviewer": args.reviewer,
+        "note": args.note,
+        "evidence": list(args.evidence or []),
+        "reviewed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def _ensure_acceptance_is_allowed(summary: dict[str, Any], artifact_dir: Path) -> None:
+    if summary.get("spec_validation_status") != "passed":
+        raise CLIError("cannot accept fidelity review when spec validation did not pass")
+    if summary.get("verification_status") != "PASS":
+        raise CLIError("cannot accept fidelity review when OR-CI verification did not pass")
+    problem_path = _artifact_path(artifact_dir, summary.get("spec"), "spec/problem.json")
+    if not problem_path.is_file():
+        raise CLIError(f"cannot accept fidelity review without generated spec: {problem_path}")
+
+
+def _update_source_fidelity_check(report: dict[str, Any], review: dict[str, Any]) -> None:
+    checks = report.get("automatic_checks")
+    if not isinstance(checks, list):
+        checks = []
+    status = "PASS" if review["status"] == "accepted" else "FAIL"
+    detail = f"manual review {review['status']}: {review['note']}"
+    for check in checks:
+        if isinstance(check, dict) and check.get("name") == "source_statement_fidelity":
+            check["status"] = status
+            check["detail"] = detail
+            break
+    else:
+        checks.append({"name": "source_statement_fidelity", "status": status, "detail": detail})
+    report["automatic_checks"] = checks
+
+
+def _write_reviewed_fidelity_markdown(
+    path: Path,
+    *,
+    summary: dict[str, Any],
+    report: dict[str, Any],
+    artifact_dir: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    statement = _read_optional_text(_artifact_path(artifact_dir, summary.get("statement_file"), "statement.txt"))
+    if not statement:
+        statement = str(report.get("statement_excerpt", "")).strip()
+    statement_excerpt = statement.replace("\r\n", "\n").strip()
+    if len(statement_excerpt) > 800:
+        statement_excerpt = statement_excerpt[:797].rstrip() + "..."
+    check_lines = [
+        f"- `{check.get('status', 'UNKNOWN')}` {check.get('name', 'unknown')}: {check.get('detail', '')}"
+        for check in report.get("automatic_checks", [])
+        if isinstance(check, dict)
+    ]
+    risk_lines = [
+        f"- `{flag.get('severity', 'unknown')}` {flag.get('code', 'unknown')}: {flag.get('message', '')}"
+        for flag in report.get("risk_flags", [])
+        if isinstance(flag, dict)
+    ] or ["- None detected by automatic checks."]
+    review = report.get("review") if isinstance(report.get("review"), dict) else {}
+    evidence_lines = [f"- {item}" for item in review.get("evidence", [])] or ["- None recorded."]
+
+    path.write_text(
+        f"""# ProblemSpec Fidelity Review
+
+## Run
+
+- Problem: `{summary.get('problem_id', 'unknown')}`
+- Statement file: `{summary.get('statement_file', '')}`
+- Generated spec: `{summary.get('spec', '')}`
+- Spec raw output: `{summary.get('spec_raw', '')}`
+- Spec generation: `{summary.get('spec_generation_status', '')}`
+- Spec validation: `{summary.get('spec_validation_status', '')}`
+- Model generation: `{summary.get('model_generation_status', '')}`
+- Verification: `{summary.get('verification_status', '')}`
+- Classification: `{summary.get('classification', '')}`
+- Fidelity status: `{summary.get('spec_fidelity_status', '')}`
+- Fidelity gate: `{summary.get('spec_fidelity_gate_status', '')}`
+- Structured report: `{summary.get('spec_fidelity_report', '')}`
+
+## Review Decision
+
+- Status: `{review.get('status', 'unknown')}`
+- Reviewer: `{review.get('reviewer', '')}`
+- Reviewed at: `{review.get('reviewed_at', '')}`
+- Note: {review.get('note', '')}
+
+## Evidence
+
+{chr(10).join(evidence_lines)}
+
+## Statement Excerpt
+
+```text
+{statement_excerpt}
+```
+
+## Automatic Checks
+
+{chr(10).join(check_lines)}
+
+## Risk Flags
+
+{chr(10).join(risk_lines)}
+""",
+        encoding="utf-8",
+    )
+
+
+def _artifact_path(artifact_dir: Path, value: Any, fallback: str) -> Path:
+    if isinstance(value, str) and value:
+        path = Path(value)
+        return path if path.is_absolute() else artifact_dir / path
+    return artifact_dir / fallback
+
+
+def _read_optional_text(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _batch_ids_from_summary(artifact_dir: Path) -> list[str]:
+    summary_path = artifact_dir / "summary.json"
+    if not summary_path.is_file():
+        raise CLIError(f"batch summary does not exist: {summary_path}")
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise CLIError(f"batch summary contains no rows: {summary_path}")
+    ids = [str(row.get("problem_id")) for row in rows if isinstance(row, dict) and row.get("problem_id")]
+    if not ids:
+        raise CLIError(f"batch summary contains no problem ids: {summary_path}")
+    return ids
+
+
+def _case_exit_code(case_dir: Path) -> int:
+    summary = _read_json_object(case_dir / "summary.json")
+    if summary.get("model_generation_status") == "generated" and summary.get("verification_status") == "PASS":
+        return 0
+    return 1
 
 
 def _generation_inputs_from_args(args: argparse.Namespace) -> GenerationInputs:

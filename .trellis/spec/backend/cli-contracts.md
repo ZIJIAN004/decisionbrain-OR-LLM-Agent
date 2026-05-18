@@ -26,6 +26,8 @@ uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifa
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
 uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>]
+uv run or-llm-agent review-fidelity --artifact-dir <solve-dir> --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
+uv run or-llm-agent review-fidelity-batch --artifact-dir <batch-dir> [--ids <ID>...] --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
 uv run or-ci validate-spec --problem <problem.json>
 ```
 
@@ -69,6 +71,16 @@ uv run or-ci validate-spec --problem <problem.json>
   These are source-statement fidelity review gates, not proof artifacts. The
   default gate status is `manual_review_required` for valid specs and
   `blocked_spec_invalid` when metadata validation fails.
+- `review-fidelity` is the deterministic manual review transition for one
+  `solve` artifact directory. It updates `summary.json`,
+  `spec/fidelity-review.json`, and `spec/fidelity-review.md`, setting
+  `spec_fidelity_status` and `spec_fidelity_gate_status` to `accepted` or
+  `rejected`.
+- `review-fidelity` must not allow `accepted` unless OR-CI metadata validation
+  passed, parent OR-CI verification returned `PASS`, and the generated spec file
+  exists. It may always record `rejected`.
+- `review-fidelity-batch` applies the same transition across a `solve-batch`
+  artifact root, then rewrites aggregate `summary.json` and `report.md`.
 - `solve-batch` runs statement-only `solve` once per id under
   `<artifact-dir>/<ID>/`, writes any dataset-sourced statement text to
   `<artifact-dir>/statements/<ID>.txt`, and writes aggregate `summary.json` and
@@ -107,6 +119,8 @@ uv run or-ci validate-spec --problem <problem.json>
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
 | Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |
 | `or-ci validate-spec` rejects generated metadata | `spec` records the failed attempt and retries up to `--max-repair-attempts`; if still failed, `solve` stops before model generation. |
+| `review-fidelity --status accepted` for a failed or unverified case | Return nonzero and do not mark the artifact accepted. |
+| `review-fidelity --status rejected` for a failed or unverified case | Record the rejection and preserve failed generation/verification status. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
 
@@ -121,6 +135,9 @@ uv run or-ci validate-spec --problem <problem.json>
 - Good: `solve-batch` writes one case directory per id, an aggregate
   `summary.json`, and a `report.md` that lists spec validation, model
   generation, OR-CI classification, and fidelity gate status per case.
+- Good: `review-fidelity-batch` transitions reviewed cases from
+  `manual_review_required` to `accepted` or `rejected` and updates the aggregate
+  batch report.
 - Base: provider credentials are invalid; `pilot` still writes the full artifact
   tree with redacted errors and failed generation statuses.
 - Base: generated ProblemSpec fails OR-CI metadata validation; `solve` writes
@@ -141,6 +158,8 @@ uv run or-ci validate-spec --problem <problem.json>
 - Run `uv run or-llm-agent spec --help`, `generate --help`, and `solve --help`
   after changing parser flags.
 - Run `uv run or-llm-agent solve-batch --help` after changing batch parser flags.
+- Run `uv run or-llm-agent review-fidelity --help` and
+  `uv run or-llm-agent review-fidelity-batch --help` after changing review flags.
 - Run `uv run or-ci validate-spec --problem tests/fixtures/bwor/BWOR-001/problem.json`
   from the OR-CI repo, or `uv run python -m or_ci.cli validate-spec --problem ...`
   from this repo when the console script is unavailable.
@@ -150,6 +169,8 @@ uv run or-ci validate-spec --problem <problem.json>
   fails.
 - Add tests that `solve-batch` writes an aggregate summary/report from mocked
   per-case solves.
+- Add tests that `review-fidelity` updates single-case summary/report artifacts
+  and that `review-fidelity-batch` rewrites aggregate batch status.
 - Run `uv run or-llm-agent health --model <model>` for static local readiness.
 - Run `uv run or-llm-agent health --model <model> --live` when checking provider
   credentials or redaction behavior.
