@@ -329,6 +329,7 @@ def solve_command(args: argparse.Namespace) -> int:
     problem_path = spec_dir / "problem.json"
     spec_raw_path = raw_dir / "spec.txt"
     spec_status_path = spec_dir / "status.json"
+    spec_fidelity_review_path = spec_dir / "fidelity-review.md"
     spec_result = generate_problem_spec(
         problem_id=args.problem_id,
         statement=statement,
@@ -347,6 +348,12 @@ def solve_command(args: argparse.Namespace) -> int:
         "spec_status": _relative(spec_status_path, artifact_dir),
         "spec_generation_status": spec_result["spec_generation_status"],
         "spec_validation_status": spec_result["spec_validation_status"],
+        "spec_generation_error": spec_result.get("generation_error", ""),
+        "spec_validation_returncode": spec_result.get("validation_returncode"),
+        "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
+        "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        "spec_fidelity_status": "not_reviewed",
+        "spec_fidelity_review": _relative(spec_fidelity_review_path, artifact_dir),
         "model_generation_status": "skipped",
         "verification_status": "skipped",
         "classification": "skipped",
@@ -354,6 +361,7 @@ def solve_command(args: argparse.Namespace) -> int:
 
     if not _spec_is_ready(spec_result):
         summary["reason"] = "spec validation failed; model generation skipped"
+        _write_spec_fidelity_review(spec_fidelity_review_path, summary=summary, statement=statement)
         _write_summary(artifact_dir / "summary.json", summary)
         print(f"{args.problem_id}: spec_validation={summary['spec_validation_status']} model_generation=skipped")
         return 1
@@ -399,6 +407,7 @@ def solve_command(args: argparse.Namespace) -> int:
             "verify_stderr": verification.stderr,
         }
     )
+    _write_spec_fidelity_review(spec_fidelity_review_path, summary=summary, statement=statement)
     _write_summary(artifact_dir / "summary.json", summary)
     print(
         f"{args.problem_id}: spec_validation={summary['spec_validation_status']} "
@@ -422,45 +431,92 @@ def generate_problem_spec(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.parent.mkdir(parents=True, exist_ok=True)
 
-    agent_result = _run_problem_spec_agent(
-        problem_id=problem_id,
-        statement=statement,
-        artifact_dir=artifact_dir.resolve(),
-        args=args,
-    )
-    raw_path.write_text(redact_text(agent_result.raw_text).rstrip() + "\n", encoding="utf-8")
+    max_attempts = 1 + max(args.max_repair_attempts, 0)
+    attempts: list[dict[str, Any]] = []
+    previous_problem: dict[str, Any] | None = None
+    previous_response = ""
+    repair_error = ""
 
+    for attempt in range(1, max_attempts + 1):
+        agent_result = _run_problem_spec_agent(
+            problem_id=problem_id,
+            statement=statement,
+            artifact_dir=artifact_dir.resolve(),
+            args=args,
+            attempt=attempt,
+            previous_problem=previous_problem,
+            previous_response=previous_response,
+            repair_error=repair_error,
+        )
+        raw_text = redact_text(agent_result.raw_text).rstrip() + "\n"
+        attempt_raw_path = _spec_attempt_raw_path(raw_path, attempt)
+        attempt_raw_path.write_text(raw_text, encoding="utf-8")
+        raw_path.write_text(raw_text, encoding="utf-8")
+
+        attempt_payload: dict[str, Any] = {
+            "attempt": attempt,
+            "mode": args.mode,
+            "spec_generation_status": "generated",
+            "spec_validation_status": "skipped",
+            "generation_error": "",
+            "raw_response": str(attempt_raw_path),
+            "agent_returncode": agent_result.returncode,
+            "agent_timed_out": agent_result.timed_out,
+            "codex_events": str(agent_result.events_path),
+            "last_message": str(agent_result.last_message_path),
+            "agent_stderr": redact_text(agent_result.stderr),
+            "repair_input_error": repair_error if attempt > 1 else "",
+        }
+
+        problem = extract_json_object(agent_result.raw_text)
+        if problem is None:
+            out_path.write_text("{}\n", encoding="utf-8")
+            generation_error = "response did not contain one JSON object"
+            attempt_payload.update(
+                {
+                    "spec_generation_status": "no_json",
+                    "generation_error": generation_error,
+                }
+            )
+            attempts.append(attempt_payload)
+            previous_problem = None
+            previous_response = raw_text
+            repair_error = generation_error
+            continue
+
+        out_path.write_text(json.dumps(problem, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        validation = run_or_ci_validate_spec(problem_path=out_path, cwd=repo_root())
+        attempt_payload.update(_spec_validation_payload(validation))
+        attempts.append(attempt_payload)
+        if validation.status == "passed":
+            break
+
+        previous_problem = problem
+        previous_response = raw_text
+        repair_error = _format_spec_repair_error(validation)
+
+    final_attempt = attempts[-1]
     payload: dict[str, Any] = {
         "problem_id": problem_id,
         "mode": args.mode,
-        "spec_generation_status": "generated",
-        "spec_validation_status": "skipped",
-        "generation_error": "",
+        "spec_generation_status": final_attempt["spec_generation_status"],
+        "spec_validation_status": final_attempt["spec_validation_status"],
+        "generation_error": final_attempt["generation_error"],
         "raw_response": str(raw_path),
         "problem": str(out_path),
         "status": str(status_path),
-        "agent_returncode": agent_result.returncode,
-        "agent_timed_out": agent_result.timed_out,
-        "codex_events": str(agent_result.events_path),
-        "last_message": str(agent_result.last_message_path),
-        "agent_stderr": redact_text(agent_result.stderr),
+        "agent_returncode": final_attempt["agent_returncode"],
+        "agent_timed_out": final_attempt["agent_timed_out"],
+        "codex_events": final_attempt["codex_events"],
+        "last_message": final_attempt["last_message"],
+        "agent_stderr": final_attempt["agent_stderr"],
+        "spec_attempt_count": len(attempts),
+        "spec_repair_status": _spec_repair_status(attempts),
+        "spec_attempts": attempts,
     }
-
-    problem = extract_json_object(agent_result.raw_text)
-    if problem is None:
-        out_path.write_text("{}\n", encoding="utf-8")
-        payload.update(
-            {
-                "spec_generation_status": "no_json",
-                "generation_error": "response did not contain one JSON object",
-            }
-        )
-        _write_summary(status_path, payload)
-        return payload
-
-    out_path.write_text(json.dumps(problem, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    validation = run_or_ci_validate_spec(problem_path=out_path, cwd=repo_root())
-    payload.update(_spec_validation_payload(validation))
+    for key in ("validation_returncode", "validation_stdout", "validation_stderr"):
+        if key in final_attempt:
+            payload[key] = final_attempt[key]
     _write_summary(status_path, payload)
     return payload
 
@@ -712,11 +768,16 @@ def _run_problem_spec_agent(
     statement: str,
     artifact_dir: Path,
     args: argparse.Namespace,
+    attempt: int = 1,
+    previous_problem: dict[str, Any] | None = None,
+    previous_response: str = "",
+    repair_error: str = "",
 ) -> ProblemSpecAgentResult:
-    session_dir = artifact_dir / "sessions" / f"{problem_id}-spec"
+    session_name = f"{problem_id}-spec" if attempt == 1 else f"{problem_id}-spec-repair-{attempt - 1}"
+    session_dir = artifact_dir / "sessions" / session_name
     events_path = session_dir / "codex-events.jsonl"
     last_message_path = session_dir / "last-message.md"
-    work_dir = neutral_work_dir(artifact_dir, f"{problem_id}-spec")
+    work_dir = neutral_work_dir(artifact_dir, session_name)
     for path in (artifact_dir, session_dir, work_dir):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -744,7 +805,13 @@ def _run_problem_spec_agent(
     try:
         result = subprocess.run(
             command,
-            input=_build_problem_spec_agent_prompt(problem_id, statement),
+            input=_build_problem_spec_agent_prompt(
+                problem_id,
+                statement,
+                previous_problem=previous_problem,
+                previous_response=previous_response,
+                repair_error=repair_error,
+            ),
             capture_output=True,
             text=True,
             check=False,
@@ -777,7 +844,19 @@ def _run_problem_spec_agent(
     )
 
 
-def _build_problem_spec_agent_prompt(problem_id: str, statement: str) -> str:
+def _build_problem_spec_agent_prompt(
+    problem_id: str,
+    statement: str,
+    *,
+    previous_problem: dict[str, Any] | None = None,
+    previous_response: str = "",
+    repair_error: str = "",
+) -> str:
+    repair_context = _build_problem_spec_repair_context(
+        previous_problem=previous_problem,
+        previous_response=previous_response,
+        repair_error=repair_error,
+    )
     return f"""{PROBLEM_SPEC_SYSTEM_PROMPT}
 
 You are running as a nested Codex agent for OR-LLM-Agent `spec --mode agent`.
@@ -785,8 +864,44 @@ Do not edit repository source files. Return the generated problem metadata as
 your final answer.
 
 {build_problem_spec_prompt(problem_id, statement)}
+{repair_context}
 
 Start now. Complete the workflow without asking for confirmation.
+"""
+
+
+def _build_problem_spec_repair_context(
+    *,
+    previous_problem: dict[str, Any] | None,
+    previous_response: str,
+    repair_error: str,
+) -> str:
+    if not repair_error:
+        return ""
+
+    previous = ""
+    if previous_problem is not None:
+        previous = json.dumps(previous_problem, ensure_ascii=False, indent=2)
+    elif previous_response:
+        previous = previous_response.strip()
+    if len(previous) > 4000:
+        previous = previous[:3997].rstrip() + "..."
+
+    return f"""
+
+Previous generated metadata failed OR-CI validation. Repair it now.
+
+Validation or extraction error:
+```text
+{repair_error.strip()}
+```
+
+Previous generated content:
+```json
+{previous}
+```
+
+Return a complete corrected metadata JSON object. Do not return a patch.
 """
 
 
@@ -799,8 +914,76 @@ def _spec_validation_payload(validation: SpecValidationResult) -> dict[str, Any]
     }
 
 
+def _spec_attempt_raw_path(raw_path: Path, attempt: int) -> Path:
+    return raw_path.with_name(f"{raw_path.stem}-attempt-{attempt}{raw_path.suffix}")
+
+
+def _format_spec_repair_error(validation: SpecValidationResult) -> str:
+    detail = validation.stderr.strip() or validation.stdout.strip()
+    if detail:
+        return detail
+    return f"or-ci validate-spec failed with returncode={validation.returncode}"
+
+
+def _spec_repair_status(attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return "failed"
+    ready = (
+        attempts[-1].get("spec_generation_status") == "generated"
+        and attempts[-1].get("spec_validation_status") == "passed"
+    )
+    if not ready:
+        return "failed"
+    return "not_needed" if len(attempts) == 1 else "repaired"
+
+
 def _spec_is_ready(result: dict[str, Any]) -> bool:
     return result.get("spec_generation_status") == "generated" and result.get("spec_validation_status") == "passed"
+
+
+def _write_spec_fidelity_review(path: Path, *, summary: dict[str, Any], statement: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    statement_excerpt = statement.replace("\r\n", "\n").strip()
+    if len(statement_excerpt) > 800:
+        statement_excerpt = statement_excerpt[:797].rstrip() + "..."
+
+    path.write_text(
+        f"""# ProblemSpec Fidelity Review
+
+## Run
+
+- Problem: `{summary['problem_id']}`
+- Statement file: `{summary['statement_file']}`
+- Generated spec: `{summary['spec']}`
+- Spec raw output: `{summary['spec_raw']}`
+- Spec generation: `{summary['spec_generation_status']}`
+- Spec validation: `{summary['spec_validation_status']}`
+- Model generation: `{summary['model_generation_status']}`
+- Verification: `{summary['verification_status']}`
+- Classification: `{summary['classification']}`
+- Fidelity status: `{summary['spec_fidelity_status']}`
+
+## Statement Excerpt
+
+```text
+{statement_excerpt}
+```
+
+## Manual Checklist
+
+- [ ] Sets and indices in `instance` match the statement.
+- [ ] Parameters and numeric values in `instance` match the statement.
+- [ ] Objective direction and coefficients match the statement.
+- [ ] Constraint families and bounds match the statement.
+- [ ] Metamorphic checks touch objective and constraint data paths, where available.
+- [ ] OR-CI result is interpreted as verification against the generated spec, not proof of original-statement correctness.
+
+## Reviewer Note
+
+TODO
+""",
+        encoding="utf-8",
+    )
 
 
 def _write_summary(path: Path, payload: dict[str, Any]) -> None:
