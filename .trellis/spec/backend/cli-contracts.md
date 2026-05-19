@@ -26,8 +26,12 @@ uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifa
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
 uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>]
-uv run or-llm-agent review-fidelity --artifact-dir <solve-dir> --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
-uv run or-llm-agent review-fidelity-batch --artifact-dir <batch-dir> [--ids <ID>...] --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
+uv run or-llm-agent review-fidelity --mode manual --artifact-dir <solve-dir> --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
+uv run or-llm-agent review-fidelity --mode agent --artifact-dir <solve-dir>
+uv run or-llm-agent review-fidelity-batch --mode manual --artifact-dir <batch-dir> [--ids <ID>...] --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
+uv run or-llm-agent review-fidelity-batch --mode agent --artifact-dir <batch-dir> [--ids <ID>...]
+uv run or-llm-agent resolve-fidelity --mode agent --artifact-dir <solve-dir> [--resolution-dir <dir>]
+uv run or-llm-agent resolve-fidelity-batch --mode agent --artifact-dir <batch-dir> [--ids <ID>...] [--resolution-dir <dir>]
 uv run or-ci validate-spec --problem <problem.json>
 ```
 
@@ -71,16 +75,42 @@ uv run or-ci validate-spec --problem <problem.json>
   These are source-statement fidelity review gates, not proof artifacts. The
   default gate status is `manual_review_required` for valid specs and
   `blocked_spec_invalid` when metadata validation fails.
-- `review-fidelity` is the deterministic manual review transition for one
-  `solve` artifact directory. It updates `summary.json`,
+- `review-fidelity --mode manual` is the deterministic manual review transition
+  for one `solve` artifact directory. It updates `summary.json`,
   `spec/fidelity-review.json`, and `spec/fidelity-review.md`, setting
   `spec_fidelity_status` and `spec_fidelity_gate_status` to `accepted` or
   `rejected`.
-- `review-fidelity` must not allow `accepted` unless OR-CI metadata validation
-  passed, parent OR-CI verification returned `PASS`, and the generated spec file
-  exists. It may always record `rejected`.
+- `review-fidelity --mode agent` launches a nested Codex reviewer for one
+  `solve` artifact directory. The reviewer must return one JSON object with
+  `status=accepted|rejected`, `confidence`, `issues`, `review_note`, and
+  `evidence`. The parent CLI records the transition as `llm_accepted` or
+  `llm_rejected` to distinguish automated review from human certification.
+- `review-fidelity` must not allow `accepted` or `llm_accepted` unless OR-CI
+  metadata validation passed, parent OR-CI verification returned `PASS`, and the
+  generated spec file exists. It may always record `rejected` or
+  `llm_rejected`.
 - `review-fidelity-batch` applies the same transition across a `solve-batch`
-  artifact root, then rewrites aggregate `summary.json` and `report.md`.
+  artifact root, then rewrites aggregate `summary.json` and `report.md`. In
+  `--mode agent`, it runs one reviewer per case so each case has independent
+  review evidence.
+- `resolve-fidelity --mode agent` is the automated post-rejection transition for
+  one `solve` artifact directory. It uses the fidelity issue as ProblemSpec
+  repair context, writes a repaired solve artifact under `--resolution-dir` or a
+  new `fidelity-resolution/attempt-N/` directory, regenerates the model,
+  reruns OR-CI verification, reruns agent fidelity review, and writes
+  `fidelity-resolution.json`.
+- `resolve-fidelity-batch --mode agent` applies the same transition across a
+  `solve-batch` root. When `--ids` is omitted and `--force` is false, it only
+  processes cases whose source artifact has `spec_fidelity_status` of
+  `rejected` or `llm_rejected`; it still rewrites the full aggregate
+  `summary.json` and `report.md`.
+- Fidelity resolution statuses are:
+  `repaired_accepted`, `repair_failed`, `residual_harmless_equivalent`,
+  `residual_material`, `residual_unresolved`, and `skipped_not_rejected`.
+- Impact classifications are:
+  `not_needed`, `harmless_equivalent`, `material`, and `unresolved`. Impact
+  analysis is deterministic and currently compares `original_solver_status`
+  objective values between the source artifact and repaired artifact.
 - `solve-batch` runs statement-only `solve` once per id under
   `<artifact-dir>/<ID>/`, writes any dataset-sourced statement text to
   `<artifact-dir>/statements/<ID>.txt`, and writes aggregate `summary.json` and
@@ -121,6 +151,11 @@ uv run or-ci validate-spec --problem <problem.json>
 | `or-ci validate-spec` rejects generated metadata | `spec` records the failed attempt and retries up to `--max-repair-attempts`; if still failed, `solve` stops before model generation. |
 | `review-fidelity --status accepted` for a failed or unverified case | Return nonzero and do not mark the artifact accepted. |
 | `review-fidelity --status rejected` for a failed or unverified case | Record the rejection and preserve failed generation/verification status. |
+| `review-fidelity --mode agent` reviewer returns no JSON or invalid status | Record `llm_rejected`, preserve agent events and final-message paths as evidence, and keep generated run status unchanged. |
+| `review-fidelity --mode agent` reviewer tries to accept a failed or unverified case | Record `llm_rejected` with a parent-gate note; do not mark the artifact accepted. |
+| `resolve-fidelity` source artifact is not rejected | Skip unless `--force` is set; record `skipped_not_rejected` if explicitly invoked. |
+| Repaired ProblemSpec does not validate or repaired solve fails | Record `repair_failed`; do not overwrite the source solve artifact. |
+| Repaired solve verifies but fidelity review still rejects | Run deterministic impact analysis and classify as `residual_harmless_equivalent`, `residual_material`, or `residual_unresolved`. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
 
@@ -138,6 +173,15 @@ uv run or-ci validate-spec --problem <problem.json>
 - Good: `review-fidelity-batch` transitions reviewed cases from
   `manual_review_required` to `accepted` or `rejected` and updates the aggregate
   batch report.
+- Good: `review-fidelity-batch --mode agent` transitions reviewed cases from
+  `manual_review_required` to `llm_accepted` or `llm_rejected`, preserving per
+  case agent evidence in each case's `spec/fidelity-review.json`.
+- Good: `resolve-fidelity` repairs a rejected source artifact into a new
+  `repaired_accepted` artifact without mutating the original generated spec or
+  submission.
+- Good: `resolve-fidelity` classifies an unrepaired residual mismatch as
+  `residual_harmless_equivalent` only when both source and repaired artifacts
+  verify and their original objective values match within tolerance.
 - Base: provider credentials are invalid; `pilot` still writes the full artifact
   tree with redacted errors and failed generation statuses.
 - Base: generated ProblemSpec fails OR-CI metadata validation; `solve` writes
@@ -171,6 +215,12 @@ uv run or-ci validate-spec --problem <problem.json>
   per-case solves.
 - Add tests that `review-fidelity` updates single-case summary/report artifacts
   and that `review-fidelity-batch` rewrites aggregate batch status.
+- Add tests that `review-fidelity --mode agent` records `llm_accepted` for a
+  valid reviewer JSON and `llm_rejected` when the reviewer returns no JSON.
+- Add tests that `resolve-fidelity` records `repaired_accepted`, records
+  `residual_harmless_equivalent` when repaired review still rejects but
+  objective values match, and that `resolve-fidelity-batch` processes only
+  rejected cases by default.
 - Run `uv run or-llm-agent health --model <model>` for static local readiness.
 - Run `uv run or-llm-agent health --model <model> --live` when checking provider
   credentials or redaction behavior.

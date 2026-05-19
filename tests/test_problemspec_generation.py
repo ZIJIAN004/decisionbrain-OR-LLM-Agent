@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from or_llm_agent.cli import ProblemSpecAgentResult, main
+from or_llm_agent.cli import FidelityReviewAgentResult, ProblemSpecAgentResult, main
 from or_llm_agent.or_ci import VerificationResult
 from or_llm_agent.prompts import build_problem_metadata_template, build_problem_spec_prompt
 
@@ -384,6 +384,63 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertIn("## Review Decision", review)
             self.assertIn("Status: `accepted`", review)
 
+    def test_review_fidelity_agent_accepts_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+
+            payload = {
+                "status": "accepted",
+                "confidence": 0.92,
+                "issues": [],
+                "review_note": "Source statement and generated spec match.",
+                "evidence": ["objective and price field match"],
+            }
+            with patch(
+                "or_llm_agent.cli._run_fidelity_review_agent",
+                return_value=_review_agent_result(root, payload),
+            ):
+                exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "llm_accepted")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "llm_accepted")
+            self.assertEqual(summary["spec_fidelity_review_mode"], "agent")
+            self.assertEqual(summary["spec_fidelity_confidence"], 0.92)
+            self.assertEqual(summary["spec_fidelity_issue_count"], 0)
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["review"]["reviewer"], "codex-agent")
+            self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
+
+    def test_review_fidelity_agent_rejects_no_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+
+            result = FidelityReviewAgentResult(
+                raw_text="not json",
+                returncode=0,
+                timed_out=False,
+                events_path=root / "review-events.jsonl",
+                last_message_path=root / "review-last-message.md",
+                stderr="",
+            )
+            with patch("or_llm_agent.cli._run_fidelity_review_agent", return_value=result):
+                exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "llm_rejected")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "llm_rejected")
+            self.assertIn("did not return a JSON object", summary["spec_fidelity_review_note"])
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["automatic_checks"][2]["status"], "FAIL")
+
     def test_review_fidelity_rejects_case_even_when_verification_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -494,6 +551,204 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(batch["rows"][0]["spec_fidelity_status"], "accepted")
             self.assertIn("accepted", (artifact_dir / "report.md").read_text(encoding="utf-8"))
 
+    def test_resolve_fidelity_repairs_rejected_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_solved_case(root, statement_path, artifact_dir, verification=_verification_with_objective(10.0))
+            main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "rejected",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Missing action in generated spec.",
+                ]
+            )
+            repair_calls = []
+
+            def fake_run(**kwargs):
+                repair_calls.append(kwargs)
+                return _agent_result(root, _valid_problem(kwargs["problem_id"]))
+
+            accepted_review = {
+                "status": "accepted",
+                "confidence": 0.91,
+                "issues": [],
+                "review_note": "Repaired spec now matches the statement.",
+                "evidence": ["missing action restored"],
+            }
+            with (
+                patch("or_llm_agent.cli._run_problem_spec_agent", fake_run),
+                patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+                patch("or_llm_agent.cli.run_or_ci_verify", _fake_verify_with_objective(10.0)),
+                patch("or_llm_agent.cli._run_fidelity_review_agent", return_value=_review_agent_result(root, accepted_review)),
+            ):
+                exit_code = main(
+                    [
+                        "resolve-fidelity",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(repair_calls)
+            self.assertIn("Missing action", repair_calls[0]["repair_error"])
+            source_summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(source_summary["fidelity_resolution_status"], "repaired_accepted")
+            self.assertEqual(source_summary["fidelity_resolution_repaired_fidelity_status"], "llm_accepted")
+            self.assertEqual(source_summary["fidelity_resolution_impact_classification"], "not_needed")
+            repaired_summary = json.loads((resolution_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(repaired_summary["spec_repair_status"], "repaired")
+            self.assertEqual(repaired_summary["spec_fidelity_status"], "llm_accepted")
+            resolution = json.loads((resolution_dir / "fidelity-resolution.json").read_text(encoding="utf-8"))
+            self.assertEqual(resolution["resolution_status"], "repaired_accepted")
+
+    def test_resolve_fidelity_classifies_harmless_equivalent_when_review_still_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_solved_case(root, statement_path, artifact_dir, verification=_verification_with_objective(10.0))
+            main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--status",
+                    "rejected",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Missing dominated terminal action.",
+                ]
+            )
+            rejected_review = {
+                "status": "rejected",
+                "confidence": 0.8,
+                "issues": [{"severity": "minor", "field": "action_space", "message": "still incomplete"}],
+                "review_note": "Residual action-space issue remains.",
+                "evidence": [],
+            }
+            with (
+                patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem())),
+                patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+                patch("or_llm_agent.cli.run_or_ci_verify", _fake_verify_with_objective(10.0)),
+                patch("or_llm_agent.cli._run_fidelity_review_agent", return_value=_review_agent_result(root, rejected_review)),
+            ):
+                exit_code = main(
+                    [
+                        "resolve-fidelity",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            source_summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(source_summary["fidelity_resolution_status"], "residual_harmless_equivalent")
+            self.assertEqual(source_summary["fidelity_resolution_impact_classification"], "harmless_equivalent")
+            resolution = json.loads((resolution_dir / "fidelity-resolution.json").read_text(encoding="utf-8"))
+            self.assertEqual(resolution["impact_analysis"]["classification"], "harmless_equivalent")
+            self.assertEqual(resolution["repaired_fidelity_status"], "llm_rejected")
+
+    def test_resolve_fidelity_batch_processes_only_rejected_cases_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+            statements_dir = artifact_dir / "statements"
+            statements_dir.mkdir(parents=True)
+            for problem_id in ("CASE-001", "CASE-002"):
+                _write_solved_case(
+                    root,
+                    statements_dir / f"{problem_id}.txt",
+                    artifact_dir / problem_id,
+                    problem_id=problem_id,
+                    verification=_verification_with_objective(10.0),
+                )
+            main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir / "CASE-001"),
+                    "--status",
+                    "rejected",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Needs repair.",
+                ]
+            )
+            main(
+                [
+                    "review-fidelity",
+                    "--artifact-dir",
+                    str(artifact_dir / "CASE-002"),
+                    "--status",
+                    "accepted",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Accepted.",
+                ]
+            )
+            rows = [
+                {
+                    "problem_id": problem_id,
+                    "exit_code": 0,
+                    "artifact_dir": problem_id,
+                    "statement_file": f"statements/{problem_id}.txt",
+                    "spec_validation_status": "passed",
+                    "spec_attempt_count": 1,
+                    "spec_repair_status": "not_needed",
+                    "model_generation_status": "generated",
+                    "verification_status": "PASS",
+                    "classification": "SUCCESS",
+                    "spec_fidelity_status": "rejected" if problem_id == "CASE-001" else "accepted",
+                    "spec_fidelity_gate_status": "rejected" if problem_id == "CASE-001" else "accepted",
+                }
+                for problem_id in ("CASE-001", "CASE-002")
+            ]
+            (artifact_dir / "summary.json").write_text(
+                json.dumps({"summary": {"total": 2}, "rows": rows}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            accepted_review = {
+                "status": "accepted",
+                "confidence": 0.9,
+                "issues": [],
+                "review_note": "Resolved.",
+                "evidence": [],
+            }
+            with (
+                patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem("CASE-001"))),
+                patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+                patch("or_llm_agent.cli.run_or_ci_verify", _fake_verify_with_objective(10.0)),
+                patch("or_llm_agent.cli._run_fidelity_review_agent", return_value=_review_agent_result(root, accepted_review)),
+            ):
+                exit_code = main(["resolve-fidelity-batch", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            resolution_summary = json.loads((artifact_dir / "fidelity-resolution-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(resolution_summary["summary"]["total"], 1)
+            self.assertEqual(resolution_summary["rows"][0]["problem_id"], "CASE-001")
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            row_by_id = {row["problem_id"]: row for row in batch["rows"]}
+            self.assertEqual(row_by_id["CASE-001"]["fidelity_resolution_status"], "repaired_accepted")
+            self.assertNotIn("fidelity_resolution_status", row_by_id["CASE-002"])
+
 
 def _agent_result(root: Path, payload: dict) -> ProblemSpecAgentResult:
     return ProblemSpecAgentResult(
@@ -504,6 +759,63 @@ def _agent_result(root: Path, payload: dict) -> ProblemSpecAgentResult:
         last_message_path=root / "last-message.md",
         stderr="",
     )
+
+
+def _review_agent_result(root: Path, payload: dict) -> FidelityReviewAgentResult:
+    return FidelityReviewAgentResult(
+        raw_text=json.dumps(payload, indent=2),
+        returncode=0,
+        timed_out=False,
+        events_path=root / "review-events.jsonl",
+        last_message_path=root / "review-last-message.md",
+        stderr="",
+    )
+
+
+def _fake_generate_agent_submission(inputs, paths, args):
+    paths.submission_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.raw_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.submission_path.write_text("def build_model(data):\n    return None\n", encoding="utf-8")
+    paths.raw_path.write_text("generated model", encoding="utf-8")
+    return {
+        "generation_status": "generated",
+        "generation_error": "",
+        "raw_response": paths.raw_path,
+        "submission": paths.submission_path,
+        "generation_mode": "agent",
+        "agent_returncode": 0,
+        "agent_timed_out": False,
+    }
+
+
+def _verification_with_objective(objective: float) -> VerificationResult:
+    return VerificationResult(
+        returncode=0,
+        stdout="",
+        stderr="",
+        report={
+            "classification": "SUCCESS",
+            "status": "PASS",
+            "checks": [
+                {
+                    "name": "original_solver_status",
+                    "status": "PASS",
+                    "details": {"objective_value": objective},
+                }
+            ],
+        },
+    )
+
+
+def _fake_verify_with_objective(objective: float):
+    verification = _verification_with_objective(objective)
+
+    def fake_verify(problem_path, submission_path, report_path, cwd):
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(verification.report, indent=2) + "\n", encoding="utf-8")
+        return verification
+
+    return fake_verify
 
 
 def _write_solved_case(
@@ -523,25 +835,16 @@ def _write_solved_case(
         report={"classification": "SUCCESS", "status": "PASS", "checks": []},
     )
 
-    def fake_generate_agent_submission(inputs, paths, args):
-        paths.submission_path.parent.mkdir(parents=True, exist_ok=True)
-        paths.raw_path.parent.mkdir(parents=True, exist_ok=True)
-        paths.submission_path.write_text("def build_model(data):\n    return None\n", encoding="utf-8")
-        paths.raw_path.write_text("generated model", encoding="utf-8")
-        return {
-            "generation_status": "generated",
-            "generation_error": "",
-            "raw_response": paths.raw_path,
-            "submission": paths.submission_path,
-            "generation_mode": "agent",
-            "agent_returncode": 0,
-            "agent_timed_out": False,
-        }
+    def fake_verify(problem_path, submission_path, report_path, cwd):
+        if verification.report is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(verification.report, indent=2) + "\n", encoding="utf-8")
+        return verification
 
     with (
         patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem(problem_id))),
-        patch("or_llm_agent.cli.generate_agent_submission", fake_generate_agent_submission),
-        patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
+        patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+        patch("or_llm_agent.cli.run_or_ci_verify", fake_verify),
     ):
         exit_code = main(
             [

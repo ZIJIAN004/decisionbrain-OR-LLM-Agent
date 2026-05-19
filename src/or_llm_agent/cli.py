@@ -51,6 +51,20 @@ class ProblemSpecAgentResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class FidelityReviewAgentResult:
+    raw_text: str
+    returncode: int
+    timed_out: bool
+    events_path: Path
+    last_message_path: Path
+    stderr: str
+
+
+FIDELITY_ACCEPTED_STATUSES = {"accepted", "llm_accepted"}
+FIDELITY_REJECTED_STATUSES = {"rejected", "llm_rejected"}
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         return _main(argv)
@@ -82,6 +96,10 @@ def _main(argv: list[str] | None = None) -> int:
         return review_fidelity_command(args)
     if args.command == "review-fidelity-batch":
         return review_fidelity_batch_command(args)
+    if args.command == "resolve-fidelity":
+        return resolve_fidelity_command(args)
+    if args.command == "resolve-fidelity-batch":
+        return resolve_fidelity_batch_command(args)
     parser.print_help()
     return 2
 
@@ -154,20 +172,43 @@ def build_parser() -> argparse.ArgumentParser:
     solve_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
     _add_agent_options(solve_batch)
 
-    review = subparsers.add_parser("review-fidelity", help="record a manual source-statement fidelity review")
+    review = subparsers.add_parser("review-fidelity", help="record a source-statement fidelity review")
     review.add_argument("--artifact-dir", required=True, type=Path, help="single solve artifact directory")
-    review.add_argument("--status", required=True, choices=("accepted", "rejected"))
-    review.add_argument("--reviewer", required=True)
-    review.add_argument("--note", required=True)
+    review.add_argument("--mode", choices=("manual", "agent"), default="manual")
+    review.add_argument("--status", choices=("accepted", "rejected"))
+    review.add_argument("--reviewer")
+    review.add_argument("--note")
     review.add_argument("--evidence", action="append", default=[])
+    _add_agent_options(review)
 
     review_batch = subparsers.add_parser("review-fidelity-batch", help="record fidelity reviews for a solve-batch")
     review_batch.add_argument("--artifact-dir", required=True, type=Path, help="solve-batch artifact directory")
     review_batch.add_argument("--ids", nargs="+")
-    review_batch.add_argument("--status", required=True, choices=("accepted", "rejected"))
-    review_batch.add_argument("--reviewer", required=True)
-    review_batch.add_argument("--note", required=True)
+    review_batch.add_argument("--mode", choices=("manual", "agent"), default="manual")
+    review_batch.add_argument("--status", choices=("accepted", "rejected"))
+    review_batch.add_argument("--reviewer")
+    review_batch.add_argument("--note")
     review_batch.add_argument("--evidence", action="append", default=[])
+    _add_agent_options(review_batch)
+
+    resolve = subparsers.add_parser("resolve-fidelity", help="repair and classify rejected source-statement fidelity")
+    resolve.add_argument("--artifact-dir", required=True, type=Path, help="single solve artifact directory")
+    resolve.add_argument("--resolution-dir", type=Path, help="directory for repaired solve artifacts")
+    resolve.add_argument("--mode", choices=("agent",), default="agent")
+    resolve.add_argument("--force", action="store_true", help="run even when source fidelity is not rejected")
+    resolve.add_argument("--impact-tolerance-abs", default=1e-6, type=float)
+    resolve.add_argument("--impact-tolerance-rel", default=1e-6, type=float)
+    _add_agent_options(resolve)
+
+    resolve_batch = subparsers.add_parser("resolve-fidelity-batch", help="repair and classify rejected fidelity cases in a solve-batch")
+    resolve_batch.add_argument("--artifact-dir", required=True, type=Path, help="solve-batch artifact directory")
+    resolve_batch.add_argument("--ids", nargs="+")
+    resolve_batch.add_argument("--resolution-dir", type=Path, help="root directory for repaired solve artifacts")
+    resolve_batch.add_argument("--mode", choices=("agent",), default="agent")
+    resolve_batch.add_argument("--force", action="store_true", help="run even when source fidelity is not rejected")
+    resolve_batch.add_argument("--impact-tolerance-abs", default=1e-6, type=float)
+    resolve_batch.add_argument("--impact-tolerance-rel", default=1e-6, type=float)
+    _add_agent_options(resolve_batch)
     return parser
 
 
@@ -496,7 +537,7 @@ def solve_batch_command(args: argparse.Namespace) -> int:
 
 def review_fidelity_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
-    review = _review_payload(args)
+    review = _fidelity_review_payload_for_artifact(artifact_dir, args)
     summary = apply_fidelity_review(artifact_dir=artifact_dir, review=review)
     print(
         f"{summary['problem_id']}: spec_fidelity_status={summary['spec_fidelity_status']} "
@@ -508,9 +549,10 @@ def review_fidelity_command(args: argparse.Namespace) -> int:
 def review_fidelity_batch_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     ids = args.ids or _batch_ids_from_summary(artifact_dir)
-    review = _review_payload(args)
     for problem_id in ids:
-        apply_fidelity_review(artifact_dir=artifact_dir / problem_id, review=review)
+        case_dir = artifact_dir / problem_id
+        review = _fidelity_review_payload_for_artifact(case_dir, args)
+        apply_fidelity_review(artifact_dir=case_dir, review=review)
 
     rows = [
         _solve_batch_row(
@@ -531,6 +573,56 @@ def review_fidelity_batch_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_fidelity_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    resolution_dir = args.resolution_dir.resolve() if args.resolution_dir else _next_attempt_dir(artifact_dir / "fidelity-resolution")
+    result = resolve_fidelity_artifact(artifact_dir=artifact_dir, resolution_dir=resolution_dir, args=args)
+    print(
+        f"{result['problem_id']}: fidelity_resolution={result['resolution_status']} "
+        f"impact={result['impact_analysis']['classification']}"
+    )
+    return 0 if result["resolution_status"] != "repair_failed" else 1
+
+
+def resolve_fidelity_batch_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    all_ids = args.ids or _batch_ids_from_summary(artifact_dir)
+    ids = list(all_ids)
+    if args.ids is None and not args.force:
+        ids = [
+            problem_id
+            for problem_id in ids
+            if _artifact_fidelity_status(artifact_dir / problem_id) in FIDELITY_REJECTED_STATUSES
+        ]
+    resolution_root = (args.resolution_dir.resolve() if args.resolution_dir else artifact_dir / "fidelity-resolution")
+    results: list[dict[str, Any]] = []
+    for problem_id in ids:
+        case_dir = artifact_dir / problem_id
+        case_resolution_dir = _next_attempt_dir(resolution_root / problem_id)
+        results.append(resolve_fidelity_artifact(artifact_dir=case_dir, resolution_dir=case_resolution_dir, args=args))
+
+    summary = summarize_fidelity_resolution(results)
+    _write_summary(artifact_dir / "fidelity-resolution-summary.json", {"summary": summary, "rows": results})
+    write_fidelity_resolution_report(artifact_dir / "fidelity-resolution-report.md", args, summary, results)
+
+    rows = [
+        _solve_batch_row(
+            problem_id=problem_id,
+            exit_code=_case_exit_code(artifact_dir / problem_id),
+            artifact_dir=artifact_dir,
+            case_dir=artifact_dir / problem_id,
+            statement_path=artifact_dir / "statements" / f"{problem_id}.txt",
+        )
+        for problem_id in all_ids
+    ]
+    batch_summary = summarize_solve_batch(rows)
+    _write_summary(artifact_dir / "summary.json", {"summary": batch_summary, "rows": rows})
+    report_args = argparse.Namespace(ids=all_ids, mode="agent")
+    write_solve_batch_report(artifact_dir / "report.md", report_args, batch_summary, rows)
+    print(f"resolved {len(results)} case(s); wrote {artifact_dir / 'fidelity-resolution-report.md'}")
+    return 0
+
+
 def generate_problem_spec(
     *,
     problem_id: str,
@@ -540,6 +632,9 @@ def generate_problem_spec(
     status_path: Path,
     artifact_dir: Path,
     args: argparse.Namespace,
+    initial_previous_problem: dict[str, Any] | None = None,
+    initial_previous_response: str = "",
+    initial_repair_error: str = "",
 ) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,9 +642,10 @@ def generate_problem_spec(
 
     max_attempts = 1 + max(args.max_repair_attempts, 0)
     attempts: list[dict[str, Any]] = []
-    previous_problem: dict[str, Any] | None = None
-    previous_response = ""
-    repair_error = ""
+    previous_problem: dict[str, Any] | None = initial_previous_problem
+    previous_response = initial_previous_response
+    repair_error = initial_repair_error
+    initial_repair_requested = bool(initial_repair_error)
 
     for attempt in range(1, max_attempts + 1):
         agent_result = _run_problem_spec_agent(
@@ -579,7 +675,7 @@ def generate_problem_spec(
             "codex_events": str(agent_result.events_path),
             "last_message": str(agent_result.last_message_path),
             "agent_stderr": redact_text(agent_result.stderr),
-            "repair_input_error": repair_error if attempt > 1 else "",
+            "repair_input_error": repair_error,
         }
 
         problem = extract_json_object(agent_result.raw_text)
@@ -625,7 +721,7 @@ def generate_problem_spec(
         "last_message": final_attempt["last_message"],
         "agent_stderr": final_attempt["agent_stderr"],
         "spec_attempt_count": len(attempts),
-        "spec_repair_status": _spec_repair_status(attempts),
+        "spec_repair_status": _spec_repair_status(attempts, initial_repair_requested=initial_repair_requested),
         "spec_attempts": attempts,
     }
     for key in ("validation_returncode", "validation_stdout", "validation_stderr"):
@@ -719,6 +815,397 @@ def generate_agent_submission(
     return payload
 
 
+def resolve_fidelity_artifact(*, artifact_dir: Path, resolution_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    source_summary_path = artifact_dir / "summary.json"
+    source_summary = _read_json_object(source_summary_path)
+    if not source_summary:
+        raise CLIError(f"solve summary does not exist or is not valid JSON: {source_summary_path}")
+
+    problem_id = str(source_summary.get("problem_id") or artifact_dir.name)
+    source_fidelity_status = str(source_summary.get("spec_fidelity_status", "not_reviewed"))
+    if source_fidelity_status not in FIDELITY_REJECTED_STATUSES and not args.force:
+        result = {
+            "problem_id": problem_id,
+            "resolution_status": "skipped_not_rejected",
+            "source_artifact": str(artifact_dir),
+            "resolution_artifact": str(resolution_dir),
+            "source_fidelity_status": source_fidelity_status,
+            "repaired_fidelity_status": "",
+            "created_at": _utc_now(),
+            "impact_analysis": {
+                "classification": "not_needed",
+                "reason": f"source fidelity status is {source_fidelity_status}",
+            },
+        }
+        report_path = resolution_dir / "fidelity-resolution.json"
+        _write_summary(report_path, result)
+        _apply_fidelity_resolution_result(source_summary_path, source_summary, result, artifact_dir, resolution_dir, report_path)
+        return result
+
+    statement_path = _artifact_path(artifact_dir, source_summary.get("statement_file"), "statement.txt")
+    if not statement_path.is_file():
+        raise CLIError(f"statement file does not exist: {statement_path}")
+    statement = _read_statement(statement_path)
+    previous_problem_path = _artifact_path(artifact_dir, source_summary.get("spec"), "spec/problem.json")
+    previous_problem = _read_json_object(previous_problem_path)
+    if not previous_problem:
+        raise CLIError(f"generated spec does not exist or is not valid JSON: {previous_problem_path}")
+    fidelity_report_path = _artifact_path(artifact_dir, source_summary.get("spec_fidelity_report"), "spec/fidelity-review.json")
+    fidelity_report = _read_json_object(fidelity_report_path)
+    repair_issue = _format_fidelity_repair_issue(source_summary=source_summary, fidelity_report=fidelity_report)
+
+    exit_code, repaired_summary = _run_repaired_solve_from_fidelity(
+        problem_id=problem_id,
+        statement=statement,
+        statement_path=statement_path,
+        source_artifact_dir=artifact_dir,
+        resolution_dir=resolution_dir,
+        previous_problem=previous_problem,
+        repair_issue=repair_issue,
+        args=args,
+    )
+
+    if exit_code == 0:
+        review_args = argparse.Namespace(**vars(args))
+        review_args.mode = "agent"
+        review = _agent_review_payload(resolution_dir, review_args)
+        repaired_summary = apply_fidelity_review(artifact_dir=resolution_dir, review=review)
+
+    repaired_fidelity_status = str(repaired_summary.get("spec_fidelity_status", "not_reviewed"))
+    if repaired_fidelity_status in FIDELITY_ACCEPTED_STATUSES:
+        impact_analysis = {"classification": "not_needed", "reason": "repaired artifact passed source-statement fidelity review"}
+        resolution_status = "repaired_accepted"
+    elif exit_code != 0:
+        impact_analysis = {"classification": "unresolved", "reason": "repaired solve did not complete successfully"}
+        resolution_status = "repair_failed"
+    else:
+        impact_analysis = analyze_fidelity_resolution_impact(
+            source_artifact_dir=artifact_dir,
+            repaired_artifact_dir=resolution_dir,
+            source_summary=source_summary,
+            repaired_summary=repaired_summary,
+            tolerance_abs=args.impact_tolerance_abs,
+            tolerance_rel=args.impact_tolerance_rel,
+        )
+        impact_classification = impact_analysis["classification"]
+        if impact_classification == "harmless_equivalent":
+            resolution_status = "residual_harmless_equivalent"
+        elif impact_classification == "material":
+            resolution_status = "residual_material"
+        else:
+            resolution_status = "residual_unresolved"
+
+    result = {
+        "problem_id": problem_id,
+        "resolution_status": resolution_status,
+        "source_artifact": str(artifact_dir),
+        "resolution_artifact": str(resolution_dir),
+        "source_fidelity_status": source_fidelity_status,
+        "repaired_fidelity_status": repaired_fidelity_status,
+        "repair_issue": repair_issue,
+        "created_at": _utc_now(),
+        "impact_analysis": impact_analysis,
+    }
+    report_path = resolution_dir / "fidelity-resolution.json"
+    _write_summary(report_path, result)
+    _apply_fidelity_resolution_result(source_summary_path, source_summary, result, artifact_dir, resolution_dir, report_path)
+    return result
+
+
+def _run_repaired_solve_from_fidelity(
+    *,
+    problem_id: str,
+    statement: str,
+    statement_path: Path,
+    source_artifact_dir: Path,
+    resolution_dir: Path,
+    previous_problem: dict[str, Any],
+    repair_issue: str,
+    args: argparse.Namespace,
+) -> tuple[int, dict[str, Any]]:
+    spec_dir = resolution_dir / "spec"
+    submissions_dir = resolution_dir / "submissions"
+    raw_dir = resolution_dir / "raw"
+    reports_dir = resolution_dir / "reports"
+    for directory in (spec_dir, submissions_dir, raw_dir, reports_dir, resolution_dir / "sessions"):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    problem_path = spec_dir / "problem.json"
+    spec_raw_path = raw_dir / "spec.txt"
+    spec_status_path = spec_dir / "status.json"
+    spec_fidelity_review_path = spec_dir / "fidelity-review.md"
+    spec_fidelity_report_path = spec_dir / "fidelity-review.json"
+    spec_result = generate_problem_spec(
+        problem_id=problem_id,
+        statement=statement,
+        out_path=problem_path,
+        raw_path=spec_raw_path,
+        status_path=spec_status_path,
+        artifact_dir=resolution_dir,
+        args=args,
+        initial_previous_problem=previous_problem,
+        initial_previous_response=json.dumps(previous_problem, ensure_ascii=False, indent=2),
+        initial_repair_error=repair_issue,
+    )
+
+    summary: dict[str, Any] = {
+        "problem_id": problem_id,
+        "statement_file": str(statement_path),
+        "source_artifact": str(source_artifact_dir),
+        "spec": _relative(problem_path, resolution_dir),
+        "spec_raw": _relative(spec_raw_path, resolution_dir),
+        "spec_status": _relative(spec_status_path, resolution_dir),
+        "spec_generation_status": spec_result["spec_generation_status"],
+        "spec_validation_status": spec_result["spec_validation_status"],
+        "spec_generation_error": spec_result.get("generation_error", ""),
+        "spec_validation_returncode": spec_result.get("validation_returncode"),
+        "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
+        "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        "spec_fidelity_status": "not_reviewed",
+        "spec_fidelity_review": _relative(spec_fidelity_review_path, resolution_dir),
+        "spec_fidelity_report": _relative(spec_fidelity_report_path, resolution_dir),
+        "model_generation_status": "skipped",
+        "verification_status": "skipped",
+        "classification": "skipped",
+        "fidelity_repair_issue": repair_issue,
+    }
+
+    if not _spec_is_ready(spec_result):
+        summary["reason"] = "repaired spec validation failed; model generation skipped"
+        _write_spec_fidelity_review(
+            spec_fidelity_review_path,
+            report_path=spec_fidelity_report_path,
+            summary=summary,
+            statement=statement,
+            problem_path=problem_path,
+        )
+        _write_summary(resolution_dir / "summary.json", summary)
+        return 1, summary
+
+    inputs = GenerationInputs(
+        problem_id=problem_id,
+        record={"id": problem_id, "en_question": statement},
+        problem_path=problem_path,
+        problem=load_problem(problem_path),
+    )
+    submission_path = submissions_dir / f"{problem_id}.py"
+    model_raw_path = raw_dir / f"{problem_id}.txt"
+    report_path = reports_dir / f"{problem_id}.json"
+    generation = generate_agent_submission(
+        inputs=inputs,
+        paths=build_agent_paths(
+            problem_id=problem_id,
+            artifact_root=resolution_dir,
+            submission_path=submission_path,
+            raw_path=model_raw_path,
+            report_path=report_path,
+        ),
+        args=args,
+    )
+    verification = run_or_ci_verify(
+        problem_path=problem_path,
+        submission_path=submission_path,
+        report_path=report_path,
+        cwd=repo_root(),
+    )
+    summary.update(
+        {
+            "submission": _relative(submission_path, resolution_dir),
+            "model_raw": _relative(model_raw_path, resolution_dir),
+            "report": _relative(report_path, resolution_dir),
+            "model_generation_status": generation["generation_status"],
+            "model_generation_error": generation["generation_error"],
+            "verification_status": verification.status,
+            "classification": verification.classification,
+            "verification_note": "passed generated spec" if verification.status == "PASS" else "failed generated spec",
+            "verify_returncode": verification.returncode,
+            "verify_stdout": verification.stdout,
+            "verify_stderr": verification.stderr,
+        }
+    )
+    _write_spec_fidelity_review(
+        spec_fidelity_review_path,
+        report_path=spec_fidelity_report_path,
+        summary=summary,
+        statement=statement,
+        problem_path=problem_path,
+    )
+    _write_summary(resolution_dir / "summary.json", summary)
+    exit_code = 0 if generation["generation_status"] == "generated" and verification.returncode == 0 else 1
+    return exit_code, summary
+
+
+def analyze_fidelity_resolution_impact(
+    *,
+    source_artifact_dir: Path,
+    repaired_artifact_dir: Path,
+    source_summary: dict[str, Any],
+    repaired_summary: dict[str, Any],
+    tolerance_abs: float,
+    tolerance_rel: float,
+) -> dict[str, Any]:
+    source_report = _read_json_object(_artifact_path(source_artifact_dir, source_summary.get("report"), "reports/report.json"))
+    repaired_report = _read_json_object(_artifact_path(repaired_artifact_dir, repaired_summary.get("report"), "reports/report.json"))
+    source_objective = _report_objective_value(source_report)
+    repaired_objective = _report_objective_value(repaired_report)
+    analysis: dict[str, Any] = {
+        "source_verification_status": source_summary.get("verification_status"),
+        "repaired_verification_status": repaired_summary.get("verification_status"),
+        "source_classification": source_summary.get("classification"),
+        "repaired_classification": repaired_summary.get("classification"),
+        "source_objective": source_objective,
+        "repaired_objective": repaired_objective,
+        "tolerance_abs": tolerance_abs,
+        "tolerance_rel": tolerance_rel,
+    }
+    if source_summary.get("verification_status") != "PASS" or repaired_summary.get("verification_status") != "PASS":
+        analysis.update({"classification": "unresolved", "reason": "both artifacts must verify before impact can be compared"})
+        return analysis
+    if source_objective is None or repaired_objective is None:
+        analysis.update({"classification": "unresolved", "reason": "missing original_solver_status objective value"})
+        return analysis
+    delta = abs(repaired_objective - source_objective)
+    threshold = max(tolerance_abs, tolerance_rel * max(1.0, abs(source_objective), abs(repaired_objective)))
+    analysis["objective_delta"] = delta
+    analysis["objective_threshold"] = threshold
+    if delta <= threshold:
+        analysis.update({"classification": "harmless_equivalent", "reason": "verified objective value is unchanged within tolerance"})
+    else:
+        analysis.update({"classification": "material", "reason": "verified objective value changed after fidelity repair"})
+    return analysis
+
+
+def _report_objective_value(report: dict[str, Any]) -> float | None:
+    checks = report.get("checks")
+    if not isinstance(checks, list):
+        return None
+    for check in checks:
+        if not isinstance(check, dict) or check.get("name") != "original_solver_status":
+            continue
+        details = check.get("details")
+        if not isinstance(details, dict):
+            return None
+        value = details.get("objective_value")
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _format_fidelity_repair_issue(*, source_summary: dict[str, Any], fidelity_report: dict[str, Any]) -> str:
+    review = fidelity_report.get("review") if isinstance(fidelity_report.get("review"), dict) else {}
+    issues = review.get("issues") if isinstance(review.get("issues"), list) else []
+    lines = [
+        "Source-statement fidelity review rejected the generated ProblemSpec.",
+        f"Review status: {source_summary.get('spec_fidelity_status', 'unknown')}",
+    ]
+    note = review.get("note") or source_summary.get("spec_fidelity_review_note")
+    if isinstance(note, str) and note.strip():
+        lines.append(f"Reviewer note: {note.strip()}")
+    if issues:
+        lines.append("Issues:")
+        for issue in issues:
+            if isinstance(issue, dict):
+                field = issue.get("field", "unknown")
+                severity = issue.get("severity", "unknown")
+                message = issue.get("message", "")
+                lines.append(f"- {severity} {field}: {message}")
+            else:
+                lines.append(f"- {issue}")
+    lines.append("Return a complete corrected OR-CI ProblemSpec JSON object. Preserve faithful fields and repair the mismatch.")
+    return "\n".join(lines)
+
+
+def summarize_fidelity_resolution(results: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    impacts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("resolution_status", "unknown"))
+        statuses[status] = statuses.get(status, 0) + 1
+        impact = result.get("impact_analysis", {}).get("classification", "unknown")
+        impacts[str(impact)] = impacts.get(str(impact), 0) + 1
+    return {"total": len(results), "resolution_statuses": statuses, "impact_classifications": impacts}
+
+
+def write_fidelity_resolution_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    matrix = [
+        "| Problem | Resolution | Source Fidelity | Repaired Fidelity | Impact | Repaired Artifact |",
+        "|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        impact = row.get("impact_analysis", {}).get("classification", "unknown")
+        matrix.append(
+            f"| {row['problem_id']} | `{row['resolution_status']}` | `{row.get('source_fidelity_status', '')}` | "
+            f"`{row.get('repaired_fidelity_status', '')}` | `{impact}` | `{row.get('resolution_artifact', '')}` |"
+        )
+    path.write_text(
+        f"""# Fidelity Resolution Report
+
+## Scope
+
+- Producer: `or_llm_agent resolve-fidelity-batch --mode {args.mode}`
+
+## Summary
+
+```json
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+```
+
+## Matrix
+
+{chr(10).join(matrix)}
+
+## Interpretation Notes
+
+- `repaired_accepted` means the source artifact was repaired into a new solve artifact that passed fidelity review.
+- `residual_harmless_equivalent` means fidelity review still did not accept the repaired artifact, but objective impact analysis found no result change.
+- `residual_material` means the repaired artifact changed the verified objective value.
+- `residual_unresolved` means the CLI could not determine impact from deterministic artifacts.
+""",
+        encoding="utf-8",
+    )
+
+
+def _apply_fidelity_resolution_result(
+    source_summary_path: Path,
+    source_summary: dict[str, Any],
+    result: dict[str, Any],
+    source_artifact_dir: Path,
+    resolution_dir: Path,
+    report_path: Path,
+) -> None:
+    impact = result.get("impact_analysis", {})
+    source_summary.update(
+        {
+            "fidelity_resolution_status": result["resolution_status"],
+            "fidelity_resolution_artifact": _relative(resolution_dir, source_artifact_dir),
+            "fidelity_resolution_report": _relative(report_path, source_artifact_dir),
+            "fidelity_resolution_repaired_fidelity_status": result.get("repaired_fidelity_status", ""),
+            "fidelity_resolution_impact_classification": impact.get("classification", "unknown"),
+        }
+    )
+    _write_summary(source_summary_path, source_summary)
+
+
+def _artifact_fidelity_status(artifact_dir: Path) -> str:
+    return str(_read_json_object(artifact_dir / "summary.json").get("spec_fidelity_status", "missing_summary"))
+
+
+def _next_attempt_dir(root: Path) -> Path:
+    for index in range(1, 1000):
+        candidate = root / f"attempt-{index}"
+        if not candidate.exists():
+            return candidate
+    raise CLIError(f"could not find available attempt directory under {root}")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def _generation_result(status: str, error: str, raw_path: Path, out_path: Path) -> dict[str, Any]:
     return {
         "generation_status": status,
@@ -782,6 +1269,8 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     model_statuses: dict[str, int] = {}
     fidelity_statuses: dict[str, int] = {}
     fidelity_gate_statuses: dict[str, int] = {}
+    fidelity_resolution_statuses: dict[str, int] = {}
+    fidelity_resolution_impacts: dict[str, int] = {}
     exit_codes: dict[str, int] = {}
     for row in rows:
         classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
@@ -791,6 +1280,12 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         fidelity_statuses[fidelity_status] = fidelity_statuses.get(fidelity_status, 0) + 1
         gate = row.get("spec_fidelity_gate_status", "unknown")
         fidelity_gate_statuses[gate] = fidelity_gate_statuses.get(gate, 0) + 1
+        if row.get("fidelity_resolution_status"):
+            status = str(row["fidelity_resolution_status"])
+            fidelity_resolution_statuses[status] = fidelity_resolution_statuses.get(status, 0) + 1
+        if row.get("fidelity_resolution_impact_classification"):
+            impact = str(row["fidelity_resolution_impact_classification"])
+            fidelity_resolution_impacts[impact] = fidelity_resolution_impacts.get(impact, 0) + 1
         exit_key = str(row["exit_code"])
         exit_codes[exit_key] = exit_codes.get(exit_key, 0) + 1
     return {
@@ -802,6 +1297,8 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "model_generation_statuses": model_statuses,
         "spec_fidelity_statuses": fidelity_statuses,
         "spec_fidelity_gate_statuses": fidelity_gate_statuses,
+        "fidelity_resolution_statuses": fidelity_resolution_statuses,
+        "fidelity_resolution_impacts": fidelity_resolution_impacts,
         "exit_codes": exit_codes,
     }
 
@@ -866,8 +1363,8 @@ def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[st
 
 def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     matrix = [
-        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity | Gate | Artifact |",
-        "|---|---:|---|---:|---|---|---|---|---|---|---|",
+        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity | Gate | Resolution | Impact | Artifact |",
+        "|---|---:|---|---:|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         matrix.append(
@@ -876,6 +1373,8 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
             f"`{row['model_generation_status']}` | `{row['verification_status']}` | "
             f"`{row['classification']}` | `{row.get('spec_fidelity_status', 'unknown')}` | "
             f"`{row.get('spec_fidelity_gate_status', 'unknown')}` | "
+            f"`{row.get('fidelity_resolution_status', '-')}` | "
+            f"`{row.get('fidelity_resolution_impact_classification', '-')}` | "
             f"`{row['artifact_dir']}` |"
         )
 
@@ -904,6 +1403,10 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
 - `spec_fidelity_gate_status=manual_review_required` means source-statement fidelity has not been certified.
 - `spec_fidelity_gate_status=accepted` means a reviewer accepted source-statement fidelity for this run artifact.
 - `spec_fidelity_gate_status=rejected` means a reviewer rejected source-statement fidelity for this run artifact.
+- `spec_fidelity_gate_status=llm_accepted` means the nested Codex reviewer accepted source-statement fidelity; keep it separate from human certification.
+- `spec_fidelity_gate_status=llm_rejected` means the nested Codex reviewer rejected or could not certify source-statement fidelity.
+- `fidelity_resolution_status=repaired_accepted` means the rejected source artifact was repaired into a new solve artifact that passed review.
+- `fidelity_resolution_impact_classification=harmless_equivalent` means a residual mismatch remained but deterministic objective comparison found no result change.
 - Inspect each case's `spec/fidelity-review.md` and `spec/fidelity-review.json` before treating generated specs as benchmark metadata.
 """,
         encoding="utf-8",
@@ -964,6 +1467,14 @@ def _solve_batch_row(
         "spec",
         "spec_fidelity_review",
         "spec_fidelity_report",
+        "spec_fidelity_review_mode",
+        "spec_fidelity_confidence",
+        "spec_fidelity_issue_count",
+        "fidelity_resolution_status",
+        "fidelity_resolution_artifact",
+        "fidelity_resolution_report",
+        "fidelity_resolution_repaired_fidelity_status",
+        "fidelity_resolution_impact_classification",
         "submission",
         "report",
     ):
@@ -980,7 +1491,7 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if not isinstance(summary, dict):
         raise CLIError(f"solve summary must be a JSON object: {summary_path}")
-    if review["status"] == "accepted":
+    if review["status"] in FIDELITY_ACCEPTED_STATUSES:
         _ensure_acceptance_is_allowed(summary, artifact_dir)
 
     review_path = _artifact_path(artifact_dir, summary.get("spec_fidelity_review"), "spec/fidelity-review.md")
@@ -1004,8 +1515,13 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
             "spec_fidelity_reviewed_by": review["reviewer"],
             "spec_fidelity_review_note": review["note"],
             "spec_fidelity_evidence": review["evidence"],
+            "spec_fidelity_review_mode": review.get("mode", "manual"),
         }
     )
+    if "confidence" in review:
+        summary["spec_fidelity_confidence"] = review["confidence"]
+    if isinstance(review.get("issues"), list):
+        summary["spec_fidelity_issue_count"] = len(review["issues"])
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1014,7 +1530,16 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
     return summary
 
 
+def _fidelity_review_payload_for_artifact(artifact_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode == "agent":
+        return _agent_review_payload(artifact_dir, args)
+    return _review_payload(args)
+
+
 def _review_payload(args: argparse.Namespace) -> dict[str, Any]:
+    missing = [name for name in ("status", "reviewer", "note") if not getattr(args, name, None)]
+    if missing:
+        raise CLIError(f"manual fidelity review requires: {', '.join('--' + name for name in missing)}")
     return {
         "mode": "manual",
         "status": args.status,
@@ -1025,22 +1550,254 @@ def _review_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _agent_review_payload(artifact_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    summary_path = artifact_dir / "summary.json"
+    summary = _read_json_object(summary_path)
+    if not summary:
+        raise CLIError(f"solve summary does not exist or is not valid JSON: {summary_path}")
+
+    result = _run_fidelity_review_agent(artifact_dir=artifact_dir, summary=summary, args=args)
+    parsed = extract_json_object(result.raw_text)
+
+    status = "llm_rejected"
+    note = "fidelity reviewer did not return a JSON object; treating source-statement fidelity as rejected"
+    confidence: float | int | None = None
+    issues: list[Any] = []
+    evidence: list[str] = [
+        f"agent events: {_relative(result.events_path, artifact_dir)}",
+        f"agent final message: {_relative(result.last_message_path, artifact_dir)}",
+    ]
+
+    if isinstance(parsed, dict):
+        decision = str(parsed.get("status", "")).strip().lower()
+        if decision == "accepted":
+            status = "llm_accepted"
+        elif decision == "rejected":
+            status = "llm_rejected"
+        else:
+            status = "llm_rejected"
+            note = f"fidelity reviewer returned unknown status {decision!r}; treating as rejected"
+
+        review_note = parsed.get("review_note") or parsed.get("note")
+        if isinstance(review_note, str) and review_note.strip():
+            note = review_note.strip()
+        elif decision in {"accepted", "rejected"}:
+            note = f"agent fidelity reviewer returned {decision}"
+
+        parsed_confidence = parsed.get("confidence")
+        if isinstance(parsed_confidence, (int, float)):
+            confidence = parsed_confidence
+
+        parsed_issues = parsed.get("issues")
+        if isinstance(parsed_issues, list):
+            issues = parsed_issues
+
+        parsed_evidence = parsed.get("evidence")
+        if isinstance(parsed_evidence, list):
+            evidence.extend(_stringify_review_evidence(item) for item in parsed_evidence)
+
+    if result.timed_out:
+        status = "llm_rejected"
+        note = f"fidelity reviewer timed out; {note}"
+    elif result.returncode != 0 and status == "llm_accepted":
+        status = "llm_rejected"
+        note = f"fidelity reviewer exited with returncode={result.returncode}; {note}"
+
+    if status == "llm_accepted":
+        block_reason = _acceptance_block_reason(summary, artifact_dir)
+        if block_reason:
+            status = "llm_rejected"
+            note = f"agent attempted to accept, but parent gate rejected acceptance: {block_reason}; {note}"
+
+    payload: dict[str, Any] = {
+        "mode": "agent",
+        "status": status,
+        "reviewer": "codex-agent",
+        "note": redact_text(note),
+        "evidence": evidence,
+        "reviewed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "issues": issues,
+        "agent_returncode": result.returncode,
+        "agent_timed_out": result.timed_out,
+        "agent_stderr": redact_text(result.stderr),
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    return payload
+
+
+def _run_fidelity_review_agent(
+    *,
+    artifact_dir: Path,
+    summary: dict[str, Any],
+    args: argparse.Namespace,
+) -> FidelityReviewAgentResult:
+    problem_id = str(summary.get("problem_id") or artifact_dir.name)
+    session_name = f"{problem_id}-fidelity-review"
+    session_dir = artifact_dir / "sessions" / session_name
+    events_path = session_dir / "codex-events.jsonl"
+    last_message_path = session_dir / "last-message.md"
+    work_dir = neutral_work_dir(artifact_dir, session_name)
+    for path in (artifact_dir, session_dir, work_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    last_message_path.unlink(missing_ok=True)
+
+    command = [
+        "codex",
+        "-a",
+        args.codex_approval,
+        "exec",
+        "--json",
+        "-C",
+        str(work_dir),
+        "--add-dir",
+        str(artifact_dir),
+        "--skip-git-repo-check",
+        "-s",
+        args.codex_sandbox,
+        "-o",
+        str(last_message_path),
+    ]
+    if args.codex_model:
+        command.extend(["-m", args.codex_model])
+    command.append("-")
+
+    timed_out = False
+    try:
+        result = subprocess.run(
+            command,
+            input=_build_fidelity_review_agent_prompt(artifact_dir=artifact_dir, summary=summary),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=args.codex_timeout_seconds if args.codex_timeout_seconds and args.codex_timeout_seconds > 0 else None,
+        )
+        returncode = result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        returncode = 124
+        stdout = _coerce_timeout_stream(exc.stdout)
+        stderr = _coerce_timeout_stream(exc.stderr)
+        timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
+        stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
+
+    events_path.write_text(redact_text(stdout), encoding="utf-8")
+    if last_message_path.exists():
+        raw_text = last_message_path.read_text(encoding="utf-8")
+    else:
+        raw_text = stdout
+        last_message_path.write_text(raw_text, encoding="utf-8")
+    return FidelityReviewAgentResult(
+        raw_text=raw_text,
+        returncode=returncode,
+        timed_out=timed_out,
+        events_path=events_path,
+        last_message_path=last_message_path,
+        stderr=redact_text(stderr),
+    )
+
+
+def _build_fidelity_review_agent_prompt(*, artifact_dir: Path, summary: dict[str, Any]) -> str:
+    statement_path = _artifact_path(artifact_dir, summary.get("statement_file"), "statement.txt")
+    problem_path = _artifact_path(artifact_dir, summary.get("spec"), "spec/problem.json")
+    report_path = _artifact_path(artifact_dir, summary.get("report"), "reports/report.json")
+    fidelity_report_path = _artifact_path(artifact_dir, summary.get("spec_fidelity_report"), "spec/fidelity-review.json")
+    statement = _read_optional_text(statement_path)
+    problem_text = _read_optional_text(problem_path)
+    report_text = _read_optional_text(report_path)
+    fidelity_text = _read_optional_text(fidelity_report_path)
+
+    return f"""You are running as a nested Codex agent for OR-LLM-Agent `review-fidelity --mode agent`.
+
+Goal: decide whether the generated OR-CI ProblemSpec faithfully represents the original natural-language problem statement.
+
+Do not edit repository source files or artifact files. Read the materials below and return exactly one JSON object.
+
+Required JSON shape:
+{{
+  "status": "accepted" | "rejected",
+  "confidence": 0.0,
+  "issues": [
+    {{"severity": "critical|major|minor", "field": "field or concept", "message": "specific mismatch or risk"}}
+  ],
+  "review_note": "short decision rationale",
+  "evidence": ["short source-backed observations"]
+}}
+
+Decision rules:
+- Accept only when the generated `instance`, objective sense and coefficients, constraint families and bounds, and metamorphic paths are faithful to the source statement.
+- OR-CI `PASS` proves only that the generated submission passed the generated spec. It does not prove that the spec matches the original statement.
+- Reject if a value, set, objective, constraint, or important metamorphic path is missing, ambiguous, invented, or materially changed.
+- Reject if the generated spec validation or model verification did not pass.
+- Keep the answer to one JSON object and no surrounding prose.
+
+Solve summary:
+```json
+{_trim_for_prompt(json.dumps(summary, ensure_ascii=False, indent=2), 6000)}
+```
+
+Original statement from `{statement_path}`:
+```text
+{_trim_for_prompt(statement, 8000)}
+```
+
+Generated ProblemSpec from `{problem_path}`:
+```json
+{_trim_for_prompt(problem_text, 12000)}
+```
+
+OR-CI verification report from `{report_path}`:
+```json
+{_trim_for_prompt(report_text, 6000)}
+```
+
+Existing fidelity report from `{fidelity_report_path}`:
+```json
+{_trim_for_prompt(fidelity_text, 6000)}
+```
+"""
+
+
+def _trim_for_prompt(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _stringify_review_evidence(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    try:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(item)
+
+
 def _ensure_acceptance_is_allowed(summary: dict[str, Any], artifact_dir: Path) -> None:
+    block_reason = _acceptance_block_reason(summary, artifact_dir)
+    if block_reason:
+        raise CLIError(f"cannot accept fidelity review: {block_reason}")
+
+
+def _acceptance_block_reason(summary: dict[str, Any], artifact_dir: Path) -> str:
     if summary.get("spec_validation_status") != "passed":
-        raise CLIError("cannot accept fidelity review when spec validation did not pass")
+        return "spec validation did not pass"
     if summary.get("verification_status") != "PASS":
-        raise CLIError("cannot accept fidelity review when OR-CI verification did not pass")
+        return "OR-CI verification did not pass"
     problem_path = _artifact_path(artifact_dir, summary.get("spec"), "spec/problem.json")
     if not problem_path.is_file():
-        raise CLIError(f"cannot accept fidelity review without generated spec: {problem_path}")
+        return f"generated spec is missing: {problem_path}"
+    return ""
 
 
 def _update_source_fidelity_check(report: dict[str, Any], review: dict[str, Any]) -> None:
     checks = report.get("automatic_checks")
     if not isinstance(checks, list):
         checks = []
-    status = "PASS" if review["status"] == "accepted" else "FAIL"
-    detail = f"manual review {review['status']}: {review['note']}"
+    status = "PASS" if review["status"] in FIDELITY_ACCEPTED_STATUSES else "FAIL"
+    detail = f"{review.get('mode', 'manual')} review {review['status']}: {review['note']}"
     for check in checks:
         if isinstance(check, dict) and check.get("name") == "source_statement_fidelity":
             check["status"] = status
@@ -1328,9 +2085,9 @@ def _build_problem_spec_repair_context(
 
     return f"""
 
-Previous generated metadata failed OR-CI validation. Repair it now.
+Previous generated metadata needs repair. Repair it now.
 
-Validation or extraction error:
+Repair issue:
 ```text
 {repair_error.strip()}
 ```
@@ -1364,7 +2121,7 @@ def _format_spec_repair_error(validation: SpecValidationResult) -> str:
     return f"or-ci validate-spec failed with returncode={validation.returncode}"
 
 
-def _spec_repair_status(attempts: list[dict[str, Any]]) -> str:
+def _spec_repair_status(attempts: list[dict[str, Any]], *, initial_repair_requested: bool = False) -> str:
     if not attempts:
         return "failed"
     ready = (
@@ -1373,7 +2130,7 @@ def _spec_repair_status(attempts: list[dict[str, Any]]) -> str:
     )
     if not ready:
         return "failed"
-    return "not_needed" if len(attempts) == 1 else "repaired"
+    return "repaired" if initial_repair_requested or len(attempts) > 1 else "not_needed"
 
 
 def _spec_is_ready(result: dict[str, Any]) -> bool:

@@ -195,3 +195,6 @@ model.ilp
 .github/
 **/shared-references/
 **/outputs/runtime/
+
+# Local tool/source checkouts.
+/pylsp/
