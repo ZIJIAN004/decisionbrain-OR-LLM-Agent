@@ -6,12 +6,54 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from or_llm_agent.cli import FidelityReviewAgentResult, ProblemSpecAgentResult, main
+from or_llm_agent.cli import CapabilityAgentResult, FidelityReviewAgentResult, ProblemSpecAgentResult, main
 from or_llm_agent.or_ci import VerificationResult
-from or_llm_agent.prompts import build_problem_metadata_template, build_problem_spec_prompt
+from or_llm_agent.prompts import build_problem_metadata_template, build_problem_spec_prompt, build_statement_capability_prompt
 
 
 class ProblemSpecGenerationTests(unittest.TestCase):
+    def test_classify_statement_writes_capability_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            capability_path = root / "spec" / "capability.json"
+            raw_path = root / "raw" / "capability.txt"
+            statement_path.write_text("Maximize profit subject to capacity.", encoding="utf-8")
+            payload = _supported_capability("linear production planning")
+
+            with patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, payload)):
+                exit_code = main(
+                    [
+                        "classify-statement",
+                        "--mode",
+                        "agent",
+                        "--statement-file",
+                        str(statement_path),
+                        "--problem-id",
+                        "CASE-001",
+                        "--out",
+                        str(capability_path),
+                        "--raw",
+                        str(raw_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            report = json.loads(capability_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "supported")
+            self.assertEqual(report["capability_generation_status"], "classified")
+            self.assertEqual(report["problem_family"], "linear production planning")
+            self.assertIn('"status": "supported"', raw_path.read_text(encoding="utf-8"))
+
+    def test_capability_prompt_documents_blocking_semantics(self) -> None:
+        prompt = build_statement_capability_prompt("CASE-001", "Goal programming with symbolic c_j.")
+
+        self.assertIn("needs_human", prompt)
+        self.assertIn("unsupported", prompt)
+        self.assertIn("symbolic coefficients", prompt)
+        self.assertIn("goal-programming", prompt)
+        self.assertIn("Do not generate a ProblemSpec", prompt)
+
     def test_problem_spec_prompt_documents_constraint_relaxation_schema(self) -> None:
         prompt = build_problem_spec_prompt("CASE-001", "A capacity-constrained LP.")
 
@@ -178,6 +220,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             }
 
             with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, _supported_capability())),
                 patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, invalid_problem)),
                 patch("or_llm_agent.cli.generate_agent_submission") as generate_agent_submission,
             ):
@@ -198,6 +241,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             generate_agent_submission.assert_not_called()
             summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["capability_status"], "supported")
             self.assertEqual(summary["spec_generation_status"], "generated")
             self.assertEqual(summary["spec_validation_status"], "failed")
             self.assertEqual(summary["spec_repair_status"], "failed")
@@ -214,6 +258,99 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
             self.assertEqual(report["gate_status"], "blocked_spec_invalid")
             self.assertEqual(report["automatic_checks"][0]["status"], "FAIL")
+
+    def test_solve_stops_before_problem_spec_when_capability_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            statement_path.write_text("Minimize cost and cholesterol as a goal programming model.", encoding="utf-8")
+            capability = {
+                "status": "unsupported",
+                "problem_family": "goal programming",
+                "supported_features": [],
+                "unsupported_features": ["multi-objective goal-programming semantics"],
+                "missing_information": [],
+                "recommended_next_action": "extend_schema_or_verifier",
+                "confidence": 0.94,
+                "review_note": "Current ProblemSpec lacks goal-programming support.",
+            }
+
+            with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, capability)),
+                patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent,
+                patch("or_llm_agent.cli.generate_agent_submission") as generate_agent_submission,
+            ):
+                exit_code = main(
+                    [
+                        "solve",
+                        "--mode",
+                        "agent",
+                        "--statement-file",
+                        str(statement_path),
+                        "--problem-id",
+                        "CASE-GOAL",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            generate_agent_submission.assert_not_called()
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["capability_status"], "unsupported")
+            self.assertEqual(summary["problem_family"], "goal programming")
+            self.assertEqual(summary["spec_generation_status"], "skipped")
+            self.assertEqual(summary["spec_validation_status"], "skipped")
+            self.assertEqual(summary["model_generation_status"], "skipped")
+            self.assertEqual(summary["classification"], "blocked_capability")
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["gate_status"], "blocked_capability")
+            self.assertIn("unsupported_feature", [flag["code"] for flag in report["risk_flags"]])
+            self.assertTrue((artifact_dir / "spec" / "capability.json").exists())
+
+    def test_solve_stops_before_problem_spec_when_capability_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            statement_path.write_text("Use trucks with symbolic costs c_j.", encoding="utf-8")
+            capability = {
+                "status": "needs_human",
+                "problem_family": "assignment",
+                "supported_features": ["linear assignment structure"],
+                "unsupported_features": [],
+                "missing_information": ["numeric truck costs c_j are not provided"],
+                "recommended_next_action": "ask_human",
+                "confidence": 0.9,
+                "review_note": "Symbolic objective coefficients require clarification.",
+            }
+
+            with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, capability)),
+                patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent,
+            ):
+                exit_code = main(
+                    [
+                        "solve",
+                        "--mode",
+                        "agent",
+                        "--statement-file",
+                        str(statement_path),
+                        "--problem-id",
+                        "CASE-SYMBOLIC",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["capability_status"], "needs_human")
+            self.assertEqual(summary["capability_missing_information"], ["numeric truck costs c_j are not provided"])
+            self.assertEqual(summary["classification"], "blocked_capability")
 
     def test_solve_writes_spec_fidelity_review_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -245,6 +382,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             )
 
             with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, _supported_capability())),
                 patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem())),
                 patch("or_llm_agent.cli.generate_agent_submission", fake_generate_agent_submission),
                 patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
@@ -265,6 +403,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["capability_status"], "supported")
             self.assertEqual(summary["spec_validation_status"], "passed")
             self.assertEqual(summary["spec_repair_status"], "not_needed")
             self.assertEqual(summary["model_generation_status"], "generated")
@@ -318,6 +457,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             )
 
             with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, _supported_capability())),
                 patch("or_llm_agent.cli._run_problem_spec_agent", fake_run),
                 patch("or_llm_agent.cli.generate_agent_submission", fake_generate_agent_submission),
                 patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
@@ -341,6 +481,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(batch["summary"]["total"], 2)
             self.assertEqual(batch["summary"]["succeeded"], 2)
+            self.assertEqual(batch["summary"]["capability_statuses"]["supported"], 2)
             self.assertEqual(batch["summary"]["spec_fidelity_statuses"]["not_reviewed"], 2)
             self.assertEqual(batch["summary"]["spec_fidelity_gate_statuses"]["manual_review_required"], 2)
             self.assertEqual(len(batch["rows"]), 2)
@@ -772,6 +913,30 @@ def _review_agent_result(root: Path, payload: dict) -> FidelityReviewAgentResult
     )
 
 
+def _capability_agent_result(root: Path, payload: dict) -> CapabilityAgentResult:
+    return CapabilityAgentResult(
+        raw_text=json.dumps(payload, indent=2),
+        returncode=0,
+        timed_out=False,
+        events_path=root / "capability-events.jsonl",
+        last_message_path=root / "capability-last-message.md",
+        stderr="",
+    )
+
+
+def _supported_capability(problem_family: str = "linear programming") -> dict:
+    return {
+        "status": "supported",
+        "problem_family": problem_family,
+        "supported_features": ["single-objective linear model with numeric data"],
+        "unsupported_features": [],
+        "missing_information": [],
+        "recommended_next_action": "continue_to_problemspec",
+        "confidence": 0.95,
+        "review_note": "Statement is within current OR-CI LP/MILP support.",
+    }
+
+
 def _fake_generate_agent_submission(inputs, paths, args):
     paths.submission_path.parent.mkdir(parents=True, exist_ok=True)
     paths.raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -842,6 +1007,7 @@ def _write_solved_case(
         return verification
 
     with (
+        patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, _supported_capability())),
         patch("or_llm_agent.cli._run_problem_spec_agent", return_value=_agent_result(root, _valid_problem(problem_id))),
         patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
         patch("or_llm_agent.cli.run_or_ci_verify", fake_verify),

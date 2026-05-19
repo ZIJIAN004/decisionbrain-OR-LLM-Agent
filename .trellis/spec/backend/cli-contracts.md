@@ -17,6 +17,7 @@ other agents that produce OR-CI submissions from BWOR problems.
 ```bash
 uv run or-llm-agent health --model <model> [--live]
 uv run or-llm-agent health --agent
+uv run or-llm-agent classify-statement --mode agent --statement-file <problem.txt> --problem-id <ID> --out <capability.json> [--raw <raw.txt>] [--artifact-dir <dir>]
 uv run or-llm-agent spec --mode agent --statement-file <problem.txt> --problem-id <ID> --out <problem.json> --raw <raw.txt> [--status <status.json>] [--artifact-dir <dir>]
 uv run or-llm-agent generate --mode api --bwor-id <BWOR-ID> --model <model> --out <submission.py> --raw <raw.txt>
 uv run or-llm-agent generate --mode agent --bwor-id <BWOR-ID> --out <submission.py> --raw <raw.txt> [--artifact-dir <dir>]
@@ -61,6 +62,16 @@ uv run or-ci validate-spec --problem <problem.json>
 - `generate` reads BWOR question text from `data/datasets/bwor.jsonl` and OR-CI
   metadata from `../or-ci/tests/fixtures/bwor/<BWOR-ID>/problem.json` unless
   flags override the paths.
+- `classify-statement` is the source-statement capability gate before
+  ProblemSpec generation. It writes a normalized JSON report with
+  `status=supported|needs_human|unsupported`, `problem_family`,
+  `supported_features`, `unsupported_features`, `missing_information`,
+  `recommended_next_action`, `confidence`, and `review_note`.
+- `solve` runs capability classification before `spec` by default and writes
+  `spec/capability.json` plus `raw/capability.txt`. If capability status is
+  `needs_human` or `unsupported`, it stops before ProblemSpec generation, writes
+  `classification=blocked_capability`, and leaves model generation and OR-CI
+  verification skipped.
 - `spec` is the statement-to-ProblemSpec producer. V1 supports agent mode first:
   nested Codex returns one JSON object, the parent CLI writes raw text and
   extracted `problem.json`, then calls `or-ci validate-spec`.
@@ -69,7 +80,7 @@ uv run or-ci validate-spec --problem <problem.json>
   does not change OR-CI verification semantics.
 - `solve` writes `spec/`, `submissions/`, `reports/`, `raw/`, `sessions/`, and
   `summary.json` under `--artifact-dir`. Its summary separates
-  `spec_generation_status`, `spec_validation_status`,
+  `capability_status`, `spec_generation_status`, `spec_validation_status`,
   `model_generation_status`, and `verification_status`.
 - `solve` writes `spec/fidelity-review.md` plus `spec/fidelity-review.json`.
   These are source-statement fidelity review gates, not proof artifacts. The
@@ -145,6 +156,8 @@ uv run or-ci validate-spec --problem <problem.json>
 | Nested Codex times out | Terminate the nested process, record return code `124` and `timed_out=true`, and still write raw/status artifacts. |
 | Nested Codex writes fallback artifacts in the neutral work dir | Parent CLI copies `submissions/`, `reports/`, `agent-status/`, and `sessions/` files into the requested artifact directory before classifying generation. |
 | Nested Codex writes no submission | Write a stub submission, record `agent_failed`, and still produce raw/status artifacts. |
+| Capability classifier returns no JSON or invalid status | Record `capability_status=needs_human`, stop before ProblemSpec generation, and preserve raw/events artifacts. |
+| Capability classifier returns `needs_human` or `unsupported` | Write a complete blocked solve summary with `classification=blocked_capability`; do not generate a ProblemSpec. |
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
 | Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |
@@ -165,11 +178,17 @@ uv run or-ci validate-spec --problem <problem.json>
   reports each OR-CI classification in `summary.json`.
 - Good: `spec` writes raw output, extracted `problem.json`, status JSON, and
   `spec_validation_status=passed`.
+- Good: `classify-statement` writes raw output and a normalized capability JSON
+  with a valid capability status.
 - Good: `solve` reaches OR-CI verification and reports `PASS` as "passed
   generated spec", not as proof that the source statement was fully modeled.
+- Good: `solve` blocks goal-programming, symbolic-coefficient, or other
+  unsupported statements before ProblemSpec generation instead of inventing an
+  LP-shaped spec.
 - Good: `solve-batch` writes one case directory per id, an aggregate
   `summary.json`, and a `report.md` that lists spec validation, model
-  generation, OR-CI classification, and fidelity gate status per case.
+  generation, OR-CI classification, capability status, and fidelity gate status
+  per case.
 - Good: `review-fidelity-batch` transitions reviewed cases from
   `manual_review_required` to `accepted` or `rejected` and updates the aggregate
   batch report.
@@ -201,6 +220,8 @@ uv run or-ci validate-spec --problem <problem.json>
 - Run `uv run or-llm-agent --help` to verify the console entry point.
 - Run `uv run or-llm-agent spec --help`, `generate --help`, and `solve --help`
   after changing parser flags.
+- Run `uv run or-llm-agent classify-statement --help` after changing capability
+  routing flags.
 - Run `uv run or-llm-agent solve-batch --help` after changing batch parser flags.
 - Run `uv run or-llm-agent review-fidelity --help` and
   `uv run or-llm-agent review-fidelity-batch --help` after changing review flags.
@@ -209,6 +230,10 @@ uv run or-ci validate-spec --problem <problem.json>
   from this repo when the console script is unavailable.
 - Add tests that `spec` writes `problem.json`, raw output, and status JSON from
   a mocked valid agent result.
+- Add tests that `classify-statement` writes capability JSON from a mocked valid
+  agent result.
+- Add tests that `solve` stops before ProblemSpec generation for
+  `needs_human` and `unsupported` capability statuses.
 - Add tests that `solve` stops before model generation when spec validation
   fails.
 - Add tests that `solve-batch` writes an aggregate summary/report from mocked

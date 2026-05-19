@@ -14,6 +14,11 @@ PROBLEM_SPEC_SYSTEM_PROMPT = (
     "Produce one OR-CI-compatible problem metadata JSON object."
 )
 
+CAPABILITY_SYSTEM_PROMPT = (
+    "You are an operations research capability classifier. "
+    "Decide whether the current OR-CI ProblemSpec and verifier can faithfully handle a problem statement."
+)
+
 PROBLEM_METADATA_TEMPLATE: dict[str, Any] = {
     "id": "<problem_id>",
     "problem_type": "LP",
@@ -77,6 +82,53 @@ Rules:
 - Valid `constraint_relaxation.relaxations[].objective_relation` values are: `non_decrease`, `increase`, `non_increase`, `decrease`.
 - Omit `evaluation_only` unless a trusted reference answer is explicitly supplied in the statement.
 - Prefer simple JSON numbers, strings, lists, and nested objects that are easy for Python/Gurobi code to consume.
+"""
+
+
+def build_statement_capability_prompt(problem_id: str, statement: str) -> str:
+    return f"""Problem id: {problem_id}
+
+Natural language problem statement:
+{statement}
+
+Classify whether the current OR-CI workflow can safely automate this statement.
+
+Current supported target:
+- deterministic, numeric, single-objective linear optimization models;
+- LP/MILP-style variables and linear constraints that Gurobi can expose through the current linear ModelIR;
+- all objective coefficients, bounds, capacities, demands, and requirements are explicit numeric data;
+- objective direction and all constraint families can be represented without inventing semantics.
+
+Current unsupported or needs-human triggers:
+- symbolic coefficients without numeric values, such as c_j;
+- source contradictions, missing required data, or unit ambiguity;
+- strict inequalities whose intended modeling treatment is not explicit;
+- multi-objective, goal-programming, lexicographic objective, preemptive-priority, or achievement-function semantics;
+- nonlinear, quadratic, conic, stochastic, robust, dynamic, or simulation-based formulations;
+- solver features OR-CI currently rejects, including multiple objectives, quadratic terms or constraints, SOS, general constraints, and piecewise-linear objectives.
+
+Return exactly one JSON object with this shape:
+
+```json
+{{
+  "status": "supported",
+  "problem_family": "short family label",
+  "supported_features": ["features the current pipeline can handle"],
+  "unsupported_features": ["features that block faithful automation"],
+  "missing_information": ["missing or ambiguous source facts"],
+  "recommended_next_action": "continue_to_problemspec | ask_human | extend_schema_or_verifier",
+  "confidence": 0.0,
+  "review_note": "short rationale"
+}}
+```
+
+Decision rules:
+- The `status` value must be exactly one of `supported`, `needs_human`, or `unsupported`.
+- Use `supported` only when the statement can be faithfully represented by the current OR-CI ProblemSpec and verified as a generated-spec LP/MILP workflow.
+- Use `needs_human` when the problem might be representable after clarification but the statement has missing, symbolic, contradictory, or ambiguous information.
+- Use `unsupported` when the problem requires semantics outside the current ProblemSpec/verifier support.
+- Do not solve the problem. Do not generate a ProblemSpec. Only classify capability.
+- Output only one JSON object. Do not include markdown or commentary.
 """
 
 

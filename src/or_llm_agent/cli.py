@@ -24,7 +24,14 @@ from or_llm_agent.code_blocks import extract_python_module, has_build_model_cont
 from or_llm_agent.codex_agent import CodexAgentOptions, CodexAgentPaths, build_agent_paths, neutral_work_dir, run_codex_agent
 from or_llm_agent.json_blocks import extract_json_object
 from or_llm_agent.or_ci import SpecValidationResult, VerificationResult, or_ci_command, run_or_ci_validate_spec, run_or_ci_verify
-from or_llm_agent.prompts import OR_CI_SYSTEM_PROMPT, PROBLEM_SPEC_SYSTEM_PROMPT, build_or_ci_prompt, build_problem_spec_prompt
+from or_llm_agent.prompts import (
+    CAPABILITY_SYSTEM_PROMPT,
+    OR_CI_SYSTEM_PROMPT,
+    PROBLEM_SPEC_SYSTEM_PROMPT,
+    build_or_ci_prompt,
+    build_problem_spec_prompt,
+    build_statement_capability_prompt,
+)
 from or_llm_agent.provider import query_llm, required_env_names
 from or_llm_agent.redaction import env_status, redact_text
 
@@ -61,8 +68,20 @@ class FidelityReviewAgentResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class CapabilityAgentResult:
+    raw_text: str
+    returncode: int
+    timed_out: bool
+    events_path: Path
+    last_message_path: Path
+    stderr: str
+
+
 FIDELITY_ACCEPTED_STATUSES = {"accepted", "llm_accepted"}
 FIDELITY_REJECTED_STATUSES = {"rejected", "llm_rejected"}
+CAPABILITY_STATUSES = {"supported", "needs_human", "unsupported"}
+CAPABILITY_BLOCKING_STATUSES = {"needs_human", "unsupported"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,6 +99,8 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "health":
         return health_command(args)
+    if args.command == "classify-statement":
+        return classify_statement_command(args)
     if args.command == "spec":
         return spec_command(args)
     if args.command == "generate":
@@ -112,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
     health.add_argument("--model", default="o3-mini")
     health.add_argument("--live", action="store_true", help="perform a minimal provider request")
     health.add_argument("--agent", action="store_true", help="check Codex agent-mode readiness")
+
+    classify = subparsers.add_parser("classify-statement", help="classify source statement support before ProblemSpec generation")
+    classify.add_argument("--mode", choices=("agent",), default="agent")
+    classify.add_argument("--statement-file", required=True, type=Path)
+    classify.add_argument("--problem-id", required=True)
+    classify.add_argument("--out", required=True, type=Path)
+    classify.add_argument("--raw", type=Path, help="raw classifier output; defaults next to --out")
+    classify.add_argument("--artifact-dir", type=Path, help="agent-mode artifact root; defaults to classifier output directory")
+    _add_agent_options(classify)
 
     spec = subparsers.add_parser("spec", help="generate and validate an OR-CI problem metadata spec")
     spec.add_argument("--mode", choices=("agent",), default="agent")
@@ -246,6 +276,27 @@ def health_command(args: argparse.Namespace) -> int:
         print(f"{label} {name}: {redact_text(detail)}")
 
     return 0 if all(ok for _, ok, _ in checks) else 1
+
+
+def classify_statement_command(args: argparse.Namespace) -> int:
+    statement = _read_statement(args.statement_file)
+    raw_path = args.raw or args.out.with_name(f"{args.out.stem}-raw.txt")
+    artifact_dir = args.artifact_dir or args.out.parent
+    result = classify_statement(
+        problem_id=args.problem_id,
+        statement=statement,
+        out_path=args.out,
+        raw_path=raw_path,
+        artifact_dir=artifact_dir,
+        args=args,
+    )
+    print(
+        f"{args.problem_id}: capability_status={result['status']} "
+        f"generation={result['capability_generation_status']}"
+    )
+    if result.get("agent_stderr"):
+        print(redact_text(str(result["agent_stderr"])), file=sys.stderr)
+    return 0 if result["capability_generation_status"] == "classified" else 1
 
 
 def spec_command(args: argparse.Namespace) -> int:
@@ -404,6 +455,69 @@ def solve_command(args: argparse.Namespace) -> int:
     spec_status_path = spec_dir / "status.json"
     spec_fidelity_review_path = spec_dir / "fidelity-review.md"
     spec_fidelity_report_path = spec_dir / "fidelity-review.json"
+    capability_path = spec_dir / "capability.json"
+    capability_raw_path = raw_dir / "capability.txt"
+    capability_result = classify_statement(
+        problem_id=args.problem_id,
+        statement=statement,
+        out_path=capability_path,
+        raw_path=capability_raw_path,
+        artifact_dir=artifact_dir,
+        args=args,
+    )
+
+    summary: dict[str, Any] = {
+        "problem_id": args.problem_id,
+        "statement_file": str(args.statement_file),
+        "capability": _relative(capability_path, artifact_dir),
+        "capability_raw": _relative(capability_raw_path, artifact_dir),
+        **_capability_summary_fields(capability_result),
+        "spec": _relative(problem_path, artifact_dir),
+        "spec_raw": _relative(spec_raw_path, artifact_dir),
+        "spec_status": _relative(spec_status_path, artifact_dir),
+        "spec_generation_status": "skipped",
+        "spec_validation_status": "skipped",
+        "spec_generation_error": "",
+        "spec_validation_returncode": None,
+        "spec_attempt_count": 0,
+        "spec_repair_status": "skipped",
+        "spec_fidelity_status": "not_reviewed",
+        "spec_fidelity_review": _relative(spec_fidelity_review_path, artifact_dir),
+        "spec_fidelity_report": _relative(spec_fidelity_report_path, artifact_dir),
+        "model_generation_status": "skipped",
+        "verification_status": "skipped",
+        "classification": "skipped",
+    }
+
+    if not _capability_is_supported(capability_result):
+        summary["classification"] = "blocked_capability"
+        summary["reason"] = (
+            f"capability routing returned {capability_result['status']}; "
+            "ProblemSpec generation skipped"
+        )
+        _write_summary(
+            spec_status_path,
+            {
+                "problem_id": args.problem_id,
+                "spec_generation_status": "skipped",
+                "spec_validation_status": "skipped",
+                "reason": summary["reason"],
+            },
+        )
+        _write_spec_fidelity_review(
+            spec_fidelity_review_path,
+            report_path=spec_fidelity_report_path,
+            summary=summary,
+            statement=statement,
+            problem_path=problem_path,
+        )
+        _write_summary(artifact_dir / "summary.json", summary)
+        print(
+            f"{args.problem_id}: capability={summary['capability_status']} "
+            "spec_generation=skipped model_generation=skipped"
+        )
+        return 1
+
     spec_result = generate_problem_spec(
         problem_id=args.problem_id,
         statement=statement,
@@ -413,26 +527,16 @@ def solve_command(args: argparse.Namespace) -> int:
         artifact_dir=artifact_dir,
         args=args,
     )
-
-    summary: dict[str, Any] = {
-        "problem_id": args.problem_id,
-        "statement_file": str(args.statement_file),
-        "spec": _relative(problem_path, artifact_dir),
-        "spec_raw": _relative(spec_raw_path, artifact_dir),
-        "spec_status": _relative(spec_status_path, artifact_dir),
-        "spec_generation_status": spec_result["spec_generation_status"],
-        "spec_validation_status": spec_result["spec_validation_status"],
-        "spec_generation_error": spec_result.get("generation_error", ""),
-        "spec_validation_returncode": spec_result.get("validation_returncode"),
-        "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
-        "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
-        "spec_fidelity_status": "not_reviewed",
-        "spec_fidelity_review": _relative(spec_fidelity_review_path, artifact_dir),
-        "spec_fidelity_report": _relative(spec_fidelity_report_path, artifact_dir),
-        "model_generation_status": "skipped",
-        "verification_status": "skipped",
-        "classification": "skipped",
-    }
+    summary.update(
+        {
+            "spec_generation_status": spec_result["spec_generation_status"],
+            "spec_validation_status": spec_result["spec_validation_status"],
+            "spec_generation_error": spec_result.get("generation_error", ""),
+            "spec_validation_returncode": spec_result.get("validation_returncode"),
+            "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
+            "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        }
+    )
 
     if not _spec_is_ready(spec_result):
         summary["reason"] = "spec validation failed; model generation skipped"
@@ -621,6 +725,38 @@ def resolve_fidelity_batch_command(args: argparse.Namespace) -> int:
     write_solve_batch_report(artifact_dir / "report.md", report_args, batch_summary, rows)
     print(f"resolved {len(results)} case(s); wrote {artifact_dir / 'fidelity-resolution-report.md'}")
     return 0
+
+
+def classify_statement(
+    *,
+    problem_id: str,
+    statement: str,
+    out_path: Path,
+    raw_path: Path,
+    artifact_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+
+    agent_result = _run_capability_agent(
+        problem_id=problem_id,
+        statement=statement,
+        artifact_dir=artifact_dir.resolve(),
+        args=args,
+    )
+    raw_text = redact_text(agent_result.raw_text).rstrip() + "\n"
+    raw_path.write_text(raw_text, encoding="utf-8")
+
+    parsed = extract_json_object(agent_result.raw_text)
+    payload = _normalize_capability_payload(
+        problem_id=problem_id,
+        parsed=parsed,
+        raw_path=raw_path,
+        agent_result=agent_result,
+    )
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return payload
 
 
 def generate_problem_spec(
@@ -1217,6 +1353,29 @@ def _generation_result(status: str, error: str, raw_path: Path, out_path: Path) 
     }
 
 
+def _capability_is_supported(result: dict[str, Any]) -> bool:
+    return result.get("status") == "supported" and result.get("capability_generation_status") == "classified"
+
+
+def _capability_summary_fields(result: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "capability_status": result.get("status", "unknown"),
+        "capability_generation_status": result.get("capability_generation_status", "unknown"),
+        "problem_family": result.get("problem_family", "unknown"),
+        "capability_supported_features": result.get("supported_features", []),
+        "capability_unsupported_features": result.get("unsupported_features", []),
+        "capability_missing_information": result.get("missing_information", []),
+        "capability_recommended_next_action": result.get("recommended_next_action", ""),
+        "capability_review_note": result.get("review_note", ""),
+        "capability_agent_returncode": result.get("agent_returncode"),
+        "capability_agent_timed_out": result.get("agent_timed_out"),
+        "capability_agent_stderr": result.get("agent_stderr", ""),
+    }
+    if "confidence" in result:
+        fields["capability_confidence"] = result["confidence"]
+    return fields
+
+
 def build_pilot_row(
     *,
     artifact_dir: Path,
@@ -1265,6 +1424,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     classifications: dict[str, int] = {}
+    capability_statuses: dict[str, int] = {}
     spec_statuses: dict[str, int] = {}
     model_statuses: dict[str, int] = {}
     fidelity_statuses: dict[str, int] = {}
@@ -1274,6 +1434,8 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     exit_codes: dict[str, int] = {}
     for row in rows:
         classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
+        capability_status = row.get("capability_status", "unknown")
+        capability_statuses[capability_status] = capability_statuses.get(capability_status, 0) + 1
         spec_statuses[row["spec_validation_status"]] = spec_statuses.get(row["spec_validation_status"], 0) + 1
         model_statuses[row["model_generation_status"]] = model_statuses.get(row["model_generation_status"], 0) + 1
         fidelity_status = row.get("spec_fidelity_status", "unknown")
@@ -1293,6 +1455,7 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "succeeded": sum(1 for row in rows if row["exit_code"] == 0),
         "failed": sum(1 for row in rows if row["exit_code"] != 0),
         "classifications": classifications,
+        "capability_statuses": capability_statuses,
         "spec_validation_statuses": spec_statuses,
         "model_generation_statuses": model_statuses,
         "spec_fidelity_statuses": fidelity_statuses,
@@ -1363,12 +1526,13 @@ def write_markdown_report(path: Path, args: argparse.Namespace, summary: dict[st
 
 def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     matrix = [
-        "| Problem | Exit | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity | Gate | Resolution | Impact | Artifact |",
-        "|---|---:|---|---:|---|---|---|---|---|---|---|---|---|",
+        "| Problem | Exit | Capability | Spec Validation | Attempts | Repair | Model Generation | Verification | Classification | Fidelity | Gate | Resolution | Impact | Artifact |",
+        "|---|---:|---|---|---:|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         matrix.append(
-            f"| {row['problem_id']} | `{row['exit_code']}` | `{row['spec_validation_status']}` | "
+            f"| {row['problem_id']} | `{row['exit_code']}` | `{row.get('capability_status', 'unknown')}` | "
+            f"`{row['spec_validation_status']}` | "
             f"`{row['spec_attempt_count']}` | `{row['spec_repair_status']}` | "
             f"`{row['model_generation_status']}` | `{row['verification_status']}` | "
             f"`{row['classification']}` | `{row.get('spec_fidelity_status', 'unknown')}` | "
@@ -1400,6 +1564,7 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
 ## Interpretation Notes
 
 - `classification=SUCCESS` means the generated submission passed OR-CI checks against the generated spec.
+- `capability_status=supported` means statement routing allowed ProblemSpec generation; `needs_human` and `unsupported` block generation before OR-CI verification.
 - `spec_fidelity_gate_status=manual_review_required` means source-statement fidelity has not been certified.
 - `spec_fidelity_gate_status=accepted` means a reviewer accepted source-statement fidelity for this run artifact.
 - `spec_fidelity_gate_status=rejected` means a reviewer rejected source-statement fidelity for this run artifact.
@@ -1442,6 +1607,9 @@ def _solve_batch_row(
         "exit_code": exit_code,
         "artifact_dir": _relative(case_dir, artifact_dir),
         "statement_file": _relative(statement_path, artifact_dir),
+        "capability_status": "missing_summary",
+        "capability_generation_status": "missing_summary",
+        "problem_family": "missing_summary",
         "spec_validation_status": "missing_summary",
         "spec_attempt_count": 0,
         "spec_repair_status": "missing_summary",
@@ -1454,6 +1622,17 @@ def _solve_batch_row(
         return row
     case_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     for key in (
+        "capability_status",
+        "capability_generation_status",
+        "problem_family",
+        "capability_supported_features",
+        "capability_unsupported_features",
+        "capability_missing_information",
+        "capability_recommended_next_action",
+        "capability_review_note",
+        "capability_confidence",
+        "capability",
+        "capability_raw",
         "spec_validation_status",
         "spec_attempt_count",
         "spec_repair_status",
@@ -1958,6 +2137,182 @@ def _default_spec_status_path(out_path: Path) -> Path:
     return out_path.parent / "status.json"
 
 
+def _run_capability_agent(
+    *,
+    problem_id: str,
+    statement: str,
+    artifact_dir: Path,
+    args: argparse.Namespace,
+) -> CapabilityAgentResult:
+    session_name = f"{problem_id}-capability"
+    session_dir = artifact_dir / "sessions" / session_name
+    events_path = session_dir / "codex-events.jsonl"
+    last_message_path = session_dir / "last-message.md"
+    work_dir = neutral_work_dir(artifact_dir, session_name)
+    for path in (artifact_dir, session_dir, work_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    last_message_path.unlink(missing_ok=True)
+
+    command = [
+        "codex",
+        "-a",
+        args.codex_approval,
+        "exec",
+        "--json",
+        "-C",
+        str(work_dir),
+        "--add-dir",
+        str(artifact_dir),
+        "--skip-git-repo-check",
+        "-s",
+        args.codex_sandbox,
+        "-o",
+        str(last_message_path),
+    ]
+    if args.codex_model:
+        command.extend(["-m", args.codex_model])
+    command.append("-")
+
+    timed_out = False
+    try:
+        result = subprocess.run(
+            command,
+            input=_build_capability_agent_prompt(problem_id=problem_id, statement=statement),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=args.codex_timeout_seconds if args.codex_timeout_seconds and args.codex_timeout_seconds > 0 else None,
+        )
+        returncode = result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        returncode = 124
+        stdout = _coerce_timeout_stream(exc.stdout)
+        stderr = _coerce_timeout_stream(exc.stderr)
+        timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
+        stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
+
+    events_path.write_text(redact_text(stdout), encoding="utf-8")
+    if last_message_path.exists():
+        raw_text = last_message_path.read_text(encoding="utf-8")
+    else:
+        raw_text = stdout
+        last_message_path.write_text(raw_text, encoding="utf-8")
+    return CapabilityAgentResult(
+        raw_text=raw_text,
+        returncode=returncode,
+        timed_out=timed_out,
+        events_path=events_path,
+        last_message_path=last_message_path,
+        stderr=redact_text(stderr),
+    )
+
+
+def _build_capability_agent_prompt(*, problem_id: str, statement: str) -> str:
+    return f"""{CAPABILITY_SYSTEM_PROMPT}
+
+You are running as a nested Codex agent for OR-LLM-Agent `classify-statement --mode agent`.
+Do not edit repository source files or artifact files. Return only the capability
+classification JSON object as your final answer.
+
+{build_statement_capability_prompt(problem_id, statement)}
+
+Start now. Complete the classification without asking for confirmation.
+"""
+
+
+def _normalize_capability_payload(
+    *,
+    problem_id: str,
+    parsed: dict[str, Any] | None,
+    raw_path: Path,
+    agent_result: CapabilityAgentResult,
+) -> dict[str, Any]:
+    status = "needs_human"
+    generation_status = "no_json"
+    note = "capability classifier did not return a JSON object; stopping before ProblemSpec generation"
+    problem_family = "unknown"
+    supported_features: list[str] = []
+    unsupported_features: list[str] = []
+    missing_information: list[str] = []
+    recommended_next_action = "ask_human"
+    confidence: float | int | None = None
+
+    if isinstance(parsed, dict):
+        requested_status = str(parsed.get("status", "")).strip().lower()
+        if requested_status in CAPABILITY_STATUSES:
+            status = requested_status
+            generation_status = "classified"
+        else:
+            generation_status = "invalid_status"
+            unsupported_features.append(f"unknown capability status: {requested_status!r}")
+
+        problem_family_value = parsed.get("problem_family")
+        if isinstance(problem_family_value, str) and problem_family_value.strip():
+            problem_family = problem_family_value.strip()
+
+        supported_features = _string_list(parsed.get("supported_features"))
+        unsupported_features.extend(_string_list(parsed.get("unsupported_features")))
+        missing_information = _string_list(parsed.get("missing_information"))
+
+        action = parsed.get("recommended_next_action")
+        if isinstance(action, str) and action.strip():
+            recommended_next_action = action.strip()
+
+        review_note = parsed.get("review_note") or parsed.get("note")
+        if isinstance(review_note, str) and review_note.strip():
+            note = review_note.strip()
+        elif generation_status == "classified":
+            note = f"capability classifier returned {status}"
+
+        parsed_confidence = parsed.get("confidence")
+        if isinstance(parsed_confidence, (int, float)) and not isinstance(parsed_confidence, bool):
+            confidence = parsed_confidence
+
+    if agent_result.timed_out:
+        status = "needs_human"
+        generation_status = "agent_timeout"
+        note = f"capability classifier timed out; {note}"
+    elif agent_result.returncode != 0:
+        if status == "supported":
+            status = "needs_human"
+            unsupported_features.append("classifier process exited nonzero after returning supported")
+            recommended_next_action = "ask_human"
+        if generation_status == "classified":
+            generation_status = "classified_with_agent_error"
+        note = f"capability classifier exited with returncode={agent_result.returncode}; {note}"
+
+    payload: dict[str, Any] = {
+        "problem_id": problem_id,
+        "mode": "agent",
+        "status": status,
+        "capability_generation_status": generation_status,
+        "problem_family": problem_family,
+        "supported_features": supported_features,
+        "unsupported_features": unsupported_features,
+        "missing_information": missing_information,
+        "recommended_next_action": recommended_next_action,
+        "review_note": redact_text(note),
+        "raw_response": str(raw_path),
+        "agent_returncode": agent_result.returncode,
+        "agent_timed_out": agent_result.timed_out,
+        "codex_events": str(agent_result.events_path),
+        "last_message": str(agent_result.last_message_path),
+        "agent_stderr": redact_text(agent_result.stderr),
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    return payload
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_stringify_review_evidence(item) for item in value]
+
+
 def _run_problem_spec_agent(
     *,
     problem_id: str,
@@ -2215,7 +2570,11 @@ TODO
 
 def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, problem_path: Path) -> dict[str, Any]:
     problem = _read_json_object(problem_path)
-    gate_status = "manual_review_required" if summary.get("spec_validation_status") == "passed" else "blocked_spec_invalid"
+    capability_status = str(summary.get("capability_status", "unknown"))
+    if capability_status in CAPABILITY_BLOCKING_STATUSES:
+        gate_status = "blocked_capability"
+    else:
+        gate_status = "manual_review_required" if summary.get("spec_validation_status") == "passed" else "blocked_spec_invalid"
     automatic_checks = [
         {
             "name": "or_ci_spec_validation",
@@ -2233,6 +2592,19 @@ def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, pro
             "detail": "manual review is required before treating generated spec as ground truth",
         },
     ]
+    if "capability_status" in summary:
+        capability_check_status = "PASS" if capability_status == "supported" else "FAIL"
+        automatic_checks.append(
+            {
+                "name": "capability_routing",
+                "status": capability_check_status,
+                "detail": (
+                    f"capability_status={capability_status}; "
+                    f"action={summary.get('capability_recommended_next_action', '')}; "
+                    f"note={summary.get('capability_review_note', '')}"
+                ),
+            }
+        )
     return {
         "problem_id": summary["problem_id"],
         "gate_status": gate_status,
@@ -2245,7 +2617,7 @@ def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, pro
         "verification_status": summary["verification_status"],
         "classification": summary["classification"],
         "automatic_checks": automatic_checks,
-        "risk_flags": _spec_fidelity_risk_flags(problem),
+        "risk_flags": [*_spec_fidelity_risk_flags(problem), *_capability_risk_flags(summary)],
         "manual_checklist": [
             "sets and indices match the statement",
             "numeric parameters match the statement",
@@ -2299,6 +2671,38 @@ def _spec_fidelity_risk_flags(problem: dict[str, Any]) -> list[dict[str, str]]:
                 "code": "no_constraint_relaxation",
                 "severity": "warning",
                 "message": "metadata has no configured constraint relaxation check",
+            }
+        )
+    return flags
+
+
+def _capability_risk_flags(summary: dict[str, Any]) -> list[dict[str, str]]:
+    status = summary.get("capability_status")
+    if status not in CAPABILITY_BLOCKING_STATUSES:
+        return []
+    flags: list[dict[str, str]] = []
+    for feature in _string_list(summary.get("capability_unsupported_features")):
+        flags.append(
+            {
+                "code": "unsupported_feature",
+                "severity": "critical" if status == "unsupported" else "warning",
+                "message": feature,
+            }
+        )
+    for item in _string_list(summary.get("capability_missing_information")):
+        flags.append(
+            {
+                "code": "missing_or_ambiguous_information",
+                "severity": "warning",
+                "message": item,
+            }
+        )
+    if not flags:
+        flags.append(
+            {
+                "code": f"capability_{status}",
+                "severity": "critical" if status == "unsupported" else "warning",
+                "message": str(summary.get("capability_review_note", "")),
             }
         )
     return flags
