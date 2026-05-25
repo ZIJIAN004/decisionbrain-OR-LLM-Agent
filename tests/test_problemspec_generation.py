@@ -679,14 +679,23 @@ class ProblemSpecGenerationTests(unittest.TestCase):
                     },
                     statement=statement,
                 )
-                result = ClarificationAgentResult(
-                    raw_text="not json",
-                    returncode=0,
-                    timed_out=False,
-                    events_path=root / f"{problem_id}-events.jsonl",
-                    last_message_path=root / f"{problem_id}-last.md",
-                    stderr="",
-                )
+                payload = {
+                    "problem_id": problem_id,
+                    "source_artifact": str(artifact_dir),
+                    "blocking_status": "needs_human",
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "issue_type": expected_issue_type,
+                            "prompt": "What human clarification resolves this blocking issue?",
+                            "source_evidence": missing_info,
+                            "allowed_answer_type": "free_text",
+                            "options": [],
+                            "required": True,
+                        }
+                    ],
+                }
+                result = _clarification_agent_result(root, payload)
                 with patch("or_llm_agent.cli._run_clarification_question_agent", return_value=result):
                     exit_code = main(
                         [
@@ -703,6 +712,82 @@ class ProblemSpecGenerationTests(unittest.TestCase):
                 self.assertEqual(questions["problem_id"], problem_id)
                 self.assertEqual(questions["questions"][0]["issue_type"], expected_issue_type)
                 self.assertTrue(questions["questions"][0]["required"])
+
+    def test_prepare_clarification_fails_loud_on_non_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            _write_needs_human_case(root, artifact_dir)
+            out_path = root / "questions.json"
+            result = ClarificationAgentResult(
+                raw_text="not json",
+                returncode=0,
+                timed_out=False,
+                events_path=root / "clarification-events.jsonl",
+                last_message_path=root / "clarification-last.md",
+                stderr="",
+            )
+
+            with patch("or_llm_agent.cli._run_clarification_question_agent", return_value=result):
+                exit_code = main(
+                    [
+                        "prepare-clarification",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--out",
+                        str(out_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(out_path.exists())
+            self.assertFalse((artifact_dir / "clarification" / "questions.json").exists())
+            status = json.loads((artifact_dir / "clarification" / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "agent_no_json")
+            self.assertEqual(status["agent_returncode"], 0)
+            self.assertFalse(status["agent_timed_out"])
+            expected_raw_path = artifact_dir.resolve() / "raw" / "clarification-questions.txt"
+            self.assertEqual(status["raw_response"], str(expected_raw_path))
+            self.assertTrue(Path(status["raw_response"]).exists())
+            self.assertEqual(expected_raw_path.read_text(encoding="utf-8"), "not json\n")
+
+    def test_prepare_clarification_fails_loud_on_agent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            _write_needs_human_case(root, artifact_dir)
+            out_path = root / "questions.json"
+            result = ClarificationAgentResult(
+                raw_text=json.dumps(_clarification_questions()),
+                returncode=1,
+                timed_out=False,
+                events_path=root / "clarification-events.jsonl",
+                last_message_path=root / "clarification-last.md",
+                stderr="planner failed",
+            )
+
+            with patch("or_llm_agent.cli._run_clarification_question_agent", return_value=result):
+                exit_code = main(
+                    [
+                        "prepare-clarification",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--out",
+                        str(out_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(out_path.exists())
+            self.assertFalse((artifact_dir / "clarification" / "questions.json").exists())
+            status = json.loads((artifact_dir / "clarification" / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "agent_failed")
+            self.assertEqual(status["agent_returncode"], 1)
+            self.assertFalse(status["agent_timed_out"])
+            self.assertEqual(status["agent_stderr"], "planner failed")
+            expected_raw_path = artifact_dir.resolve() / "raw" / "clarification-questions.txt"
+            self.assertEqual(status["raw_response"], str(expected_raw_path))
+            self.assertTrue(Path(status["raw_response"]).exists())
 
     def test_answer_clarification_blocks_when_required_unanswered(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1172,6 +1172,17 @@ def prepare_clarification_artifact(
     raw_text = redact_text(agent_result.raw_text).rstrip() + "\n"
     raw_path.write_text(raw_text, encoding="utf-8")
 
+    if agent_result.timed_out or agent_result.returncode != 0:
+        status_path = _write_clarification_agent_failure_status(
+            artifact_dir=artifact_dir,
+            status="agent_failed",
+            raw_path=raw_path,
+            agent_result=agent_result,
+        )
+        raise CLIError(
+            f"clarification question planner failed; status={status_path}; raw_response={raw_path}"
+        )
+
     parsed = extract_json_object(agent_result.raw_text)
     if isinstance(parsed, dict):
         parsed["problem_id"] = problem_id
@@ -1179,12 +1190,14 @@ def prepare_clarification_artifact(
         parsed["blocking_status"] = "needs_human"
         payload = normalize_clarification_questions(parsed, source_path=out_path)
     else:
-        payload = _fallback_clarification_questions(
-            problem_id=problem_id,
+        status_path = _write_clarification_agent_failure_status(
             artifact_dir=artifact_dir,
-            capability=capability,
+            status="agent_no_json",
             raw_path=raw_path,
             agent_result=agent_result,
+        )
+        raise CLIError(
+            f"clarification question JSON is malformed; status={status_path}; raw_response={raw_path}"
         )
 
     payload["raw_response"] = str(raw_path)
@@ -2253,57 +2266,27 @@ def _write_clarification_artifact(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _fallback_clarification_questions(
+def _write_clarification_agent_failure_status(
     *,
-    problem_id: str,
     artifact_dir: Path,
-    capability: dict[str, Any],
+    status: str,
     raw_path: Path,
     agent_result: ClarificationAgentResult,
-) -> dict[str, Any]:
-    missing_information = _string_list(capability.get("missing_information"))
-    review_note = str(capability.get("review_note") or "Capability classifier could not safely continue.")
-    issues = missing_information or [review_note]
-    questions = []
-    for index, issue in enumerate(issues, 1):
-        questions.append(
-            {
-                "id": f"q{index}",
-                "issue_type": _infer_clarification_issue_type(issue),
-                "prompt": f"Please clarify this blocking issue before ProblemSpec generation: {issue}",
-                "source_evidence": issue,
-                "allowed_answer_type": "free_text",
-                "options": [],
-                "required": True,
-            }
-        )
-    return {
-        "problem_id": problem_id,
-        "source_artifact": _portable_source_artifact(artifact_dir),
-        "blocking_status": "needs_human",
-        "questions": questions,
-        "raw_response": str(raw_path),
-        "agent_returncode": agent_result.returncode,
-        "agent_timed_out": agent_result.timed_out,
-        "codex_events": str(agent_result.events_path),
-        "last_message": str(agent_result.last_message_path),
-        "agent_stderr": redact_text(agent_result.stderr),
-    }
-
-
-def _infer_clarification_issue_type(issue: str) -> str:
-    text = issue.lower()
-    if any(token in text for token in ("unit", "yuan", "dollar", "kg", "ton", "thousand", "million")):
-        return "unit_conflict"
-    if any(token in text for token in ("cost", "coefficient", "numeric", "value", "missing", "symbolic")):
-        return "missing_numeric_data"
-    if "objective" in text:
-        return "ambiguous_objective"
-    if any(token in text for token in ("time", "period", "year", "return")):
-        return "timing_convention"
-    if any(token in text for token in ("conflict", "contradict")):
-        return "data_conflict"
-    return "modeling_convention"
+) -> Path:
+    status_path = artifact_dir / "clarification" / "status.json"
+    _write_clarification_artifact(
+        status_path,
+        {
+            "status": status,
+            "agent_returncode": agent_result.returncode,
+            "agent_timed_out": agent_result.timed_out,
+            "raw_response": str(raw_path),
+            "codex_events": str(agent_result.events_path),
+            "last_message": str(agent_result.last_message_path),
+            "agent_stderr": redact_text(agent_result.stderr),
+        },
+    )
+    return status_path
 
 
 def _clarification_context(
