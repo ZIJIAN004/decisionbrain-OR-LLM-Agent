@@ -19,6 +19,11 @@ CAPABILITY_SYSTEM_PROMPT = (
     "Decide whether the current OR-CI ProblemSpec and verifier can faithfully handle a problem statement."
 )
 
+CLARIFICATION_SYSTEM_PROMPT = (
+    "You are an operations research clarification planner. "
+    "Ask only the human questions needed to unblock faithful ProblemSpec generation."
+)
+
 PROBLEM_METADATA_TEMPLATE: dict[str, Any] = {
     "id": "<problem_id>",
     "problem_type": "LP",
@@ -81,6 +86,99 @@ Rules:
 - `paths` must be a non-empty list of JSON paths under `instance`, and `factor` must be a positive multiplier such as `1.1` for a resource increase or `0.9` for a requirement decrease.
 - Valid `constraint_relaxation.relaxations[].objective_relation` values are: `non_decrease`, `increase`, `non_increase`, `decrease`.
 - Omit `evaluation_only` unless a trusted reference answer is explicitly supplied in the statement.
+- Prefer simple JSON numbers, strings, lists, and nested objects that are easy for Python/Gurobi code to consume.
+"""
+
+
+def build_clarification_question_prompt(
+    problem_id: str,
+    statement: str,
+    capability: dict[str, Any],
+) -> str:
+    return f"""Problem id: {problem_id}
+
+Natural language problem statement:
+{statement}
+
+Capability classifier result:
+```json
+{json.dumps(capability, ensure_ascii=False, indent=2)}
+```
+
+Generate the minimal explicit clarification questions needed before OR-LLM-Agent
+can faithfully produce an OR-CI ProblemSpec. Focus only on missing data,
+ambiguous objectives, unit conflicts, domain choices, timing conventions, data
+conflicts, and modeling conventions that would otherwise require guessing.
+
+Return exactly one JSON object with this shape:
+
+```json
+{{
+  "problem_id": "{problem_id}",
+  "source_artifact": "path to the blocked solve artifact",
+  "blocking_status": "needs_human",
+  "questions": [
+    {{
+      "id": "q1",
+      "issue_type": "missing_numeric_data",
+      "prompt": "What numeric value should be used for the missing coefficient?",
+      "source_evidence": "Quote or summarize the ambiguous source text.",
+      "allowed_answer_type": "free_text",
+      "options": [],
+      "required": true
+    }}
+  ]
+}}
+```
+
+Rules:
+- Output only one JSON object. Do not include markdown or commentary.
+- `blocking_status` must be `needs_human`.
+- `issue_type` must be one of: `missing_numeric_data`, `ambiguous_objective`, `unit_conflict`, `domain_choice`, `timing_convention`, `data_conflict`, `modeling_convention`.
+- `allowed_answer_type` must be one of: `free_text`, `single_choice`, `multi_choice`, `number`, `boolean`.
+- Use `single_choice` or `multi_choice` only when the source clearly exposes a finite option set; otherwise use `free_text` or `number`.
+- Each required ambiguity must have a question. Do not ask broad or speculative questions.
+- Do not solve the problem or invent the answer.
+"""
+
+
+def build_clarified_problem_spec_prompt(
+    problem_id: str,
+    statement: str,
+    clarification: dict[str, Any],
+) -> str:
+    return f"""Problem id: {problem_id}
+
+Original natural language problem statement:
+{statement}
+
+Approved clarification context:
+```json
+{json.dumps(clarification, ensure_ascii=False, indent=2)}
+```
+
+Generate exactly one JSON object matching this OR-CI problem metadata template:
+
+```json
+{build_problem_metadata_template(problem_id)}
+```
+
+Rules:
+- Output only one JSON object. Do not include markdown, commentary, or Python.
+- Use the provided problem id as the `id`.
+- Treat the original statement plus approved clarification answers as the source. Do not use unapproved assumptions.
+- Include only facts supported by the original statement or the clarification answers.
+- Add a top-level `source_context` object with `clarified: true`, `clarification_status`, and `clarified_from`.
+- Put all model data needed by solver code under `instance`.
+- Preserve primitive statement quantities under `instance`. If the statement gives separate profit and transport cost, keep both fields; do not replace them only with a derived net-benefit field.
+- Derived fields may be included only when the primitive fields used to derive them are also present.
+- Include `metamorphic.cost_scaling` with at least one numeric objective coefficient path.
+- Point `cost_scaling.coefficient_paths` at primitive objective coefficients where practical. For profit-minus-cost objectives, include both profit and cost coefficient paths.
+- Add `metamorphic.constraint_relaxation` only when the clarified source has a clear resource, demand, supply, or capacity value whose relaxation direction is defensible.
+- Each `constraint_relaxation.relaxations[]` entry must use `name`, `paths`, `factor`, and `objective_relation`; do not use `path`, `amount`, or `direction`.
+- `paths` must be a non-empty list of JSON paths under `instance`, and `factor` must be a positive multiplier such as `1.1` for a resource increase or `0.9` for a requirement decrease.
+- Valid `constraint_relaxation.relaxations[].objective_relation` values are: `non_decrease`, `increase`, `non_increase`, `decrease`.
+- Omit `evaluation_only` unless a trusted reference answer is explicitly supplied in the statement or clarification answers.
 - Prefer simple JSON numbers, strings, lists, and nested objects that are easy for Python/Gurobi code to consume.
 """
 

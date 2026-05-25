@@ -6,9 +6,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from or_llm_agent.cli import CapabilityAgentResult, FidelityReviewAgentResult, ProblemSpecAgentResult, main
+from or_llm_agent.cli import (
+    CapabilityAgentResult,
+    ClarificationAgentResult,
+    FidelityReviewAgentResult,
+    ProblemSpecAgentResult,
+    load_clarification_answers,
+    load_clarification_questions,
+    main,
+)
 from or_llm_agent.or_ci import VerificationResult
-from or_llm_agent.prompts import build_problem_metadata_template, build_problem_spec_prompt, build_statement_capability_prompt
+from or_llm_agent.prompts import (
+    build_clarification_question_prompt,
+    build_clarified_problem_spec_prompt,
+    build_problem_metadata_template,
+    build_problem_spec_prompt,
+    build_statement_capability_prompt,
+)
 
 
 class ProblemSpecGenerationTests(unittest.TestCase):
@@ -351,6 +365,509 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(summary["capability_status"], "needs_human")
             self.assertEqual(summary["capability_missing_information"], ["numeric truck costs c_j are not provided"])
             self.assertEqual(summary["classification"], "blocked_capability")
+
+    def test_clarification_question_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "questions.json"
+            path.write_text(json.dumps(_clarification_questions()), encoding="utf-8")
+
+            artifact = load_clarification_questions(path)
+
+            self.assertEqual(artifact["problem_id"], "CASE-SYMBOLIC")
+            self.assertEqual(artifact["blocking_status"], "needs_human")
+            self.assertEqual(artifact["questions"][0]["issue_type"], "missing_numeric_data")
+
+    def test_clarification_question_schema_rejects_unknown_issue_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "questions.json"
+            payload = _clarification_questions()
+            payload["questions"][0]["issue_type"] = "guess_anyway"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(Exception, "unsupported clarification issue_type"):
+                load_clarification_questions(path)
+
+    def test_clarification_answer_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            questions_path = root / "questions.json"
+            answers_path = root / "answers.json"
+            questions_path.write_text(json.dumps(_clarification_questions()), encoding="utf-8")
+            answers_path.write_text(json.dumps(_clarification_answers(reviewer="")), encoding="utf-8")
+
+            questions = load_clarification_questions(questions_path)
+            answers = load_clarification_answers(answers_path, questions=questions, reviewer="unit-test")
+
+            self.assertEqual(answers["resolution_status"], "answered")
+            self.assertEqual(answers["answers"][0]["reviewer"], "unit-test")
+            self.assertEqual(answers["answers"][0]["source"], "manual_review")
+
+    def test_clarification_answer_schema_marks_missing_required_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            questions_path = root / "questions.json"
+            answers_path = root / "answers.json"
+            questions_path.write_text(json.dumps(_clarification_questions()), encoding="utf-8")
+            answers_path.write_text(
+                json.dumps({"problem_id": "CASE-SYMBOLIC", "answers": [], "resolution_status": "answered"}),
+                encoding="utf-8",
+            )
+
+            questions = load_clarification_questions(questions_path)
+            answers = load_clarification_answers(answers_path, questions=questions, reviewer="unit-test")
+
+            self.assertEqual(answers["resolution_status"], "partially_answered")
+
+    def test_clarification_prompts_document_required_contracts(self) -> None:
+        question_prompt = build_clarification_question_prompt(
+            "CASE-SYMBOLIC",
+            "Use trucks with symbolic costs c_j.",
+            {"status": "needs_human", "missing_information": ["numeric truck costs c_j are not provided"]},
+        )
+        spec_prompt = build_clarified_problem_spec_prompt(
+            "CASE-SYMBOLIC",
+            "Use trucks with symbolic costs c_j.",
+            {"answers": [{"question_id": "q1", "answer": "costs are 1, 2, 3"}]},
+        )
+
+        self.assertIn("missing_numeric_data", question_prompt)
+        self.assertIn("Do not solve the problem or invent the answer", question_prompt)
+        self.assertIn("Approved clarification context", spec_prompt)
+        self.assertIn("source_context", spec_prompt)
+        self.assertIn("Do not use unapproved assumptions", spec_prompt)
+
+    def test_prepare_clarification_writes_question_artifact_for_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            _write_needs_human_case(root, artifact_dir)
+            out_path = root / "questions.json"
+            payload = _clarification_questions()
+
+            with patch(
+                "or_llm_agent.cli._run_clarification_question_agent",
+                return_value=_clarification_agent_result(root, payload),
+            ):
+                exit_code = main(
+                    [
+                        "prepare-clarification",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--out",
+                        str(out_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            written = json.loads(out_path.read_text(encoding="utf-8"))
+            self.assertEqual(written["questions"][0]["id"], "q1")
+            self.assertTrue((artifact_dir / "clarification" / "questions.json").exists())
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["classification"], "blocked_capability")
+
+    def test_prepare_clarification_golden_bwor_ambiguity_classes(self) -> None:
+        cases = [
+            (
+                "BWOR-013",
+                "At least 10% of 1000 thousand yuan, i.e. 1 million yuan, must be reserved.",
+                "The statement says 10% of 1000 thousand yuan but also says 1 million yuan.",
+                "unit_conflict",
+            ),
+            (
+                "BWOR-020",
+                "The cost of using truck j is c_j.",
+                "numeric truck costs c_j are not provided",
+                "missing_numeric_data",
+            ),
+            (
+                "BWOR-027",
+                "Find the shortest route that visits each city exactly once.",
+                "Clarify whether the route must return to the starting city and which distance convention to use.",
+                "timing_convention",
+            ),
+            (
+                "BWOR-046",
+                "Factory supply is 270 tons and regional demand totals 290 tons.",
+                "capacity-demand conflict makes the transportation problem infeasible unless unmet demand or extra supply is clarified",
+                "data_conflict",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for problem_id, statement, missing_info, expected_issue_type in cases:
+                artifact_dir = root / problem_id
+                _write_blocked_case(
+                    root,
+                    artifact_dir,
+                    problem_id=problem_id,
+                    capability={
+                        "status": "needs_human",
+                        "problem_family": "clarification golden",
+                        "supported_features": ["linear structure after clarification"],
+                        "unsupported_features": [],
+                        "missing_information": [missing_info],
+                        "recommended_next_action": "ask_human",
+                        "confidence": 0.9,
+                        "review_note": missing_info,
+                    },
+                    statement=statement,
+                )
+                result = ClarificationAgentResult(
+                    raw_text="not json",
+                    returncode=0,
+                    timed_out=False,
+                    events_path=root / f"{problem_id}-events.jsonl",
+                    last_message_path=root / f"{problem_id}-last.md",
+                    stderr="",
+                )
+                with patch("or_llm_agent.cli._run_clarification_question_agent", return_value=result):
+                    exit_code = main(
+                        [
+                            "prepare-clarification",
+                            "--artifact-dir",
+                            str(artifact_dir),
+                            "--out",
+                            str(root / f"{problem_id}-questions.json"),
+                        ]
+                    )
+
+                self.assertEqual(exit_code, 0, problem_id)
+                questions = json.loads((artifact_dir / "clarification" / "questions.json").read_text(encoding="utf-8"))
+                self.assertEqual(questions["problem_id"], problem_id)
+                self.assertEqual(questions["questions"][0]["issue_type"], expected_issue_type)
+                self.assertTrue(questions["questions"][0]["required"])
+
+    def test_answer_clarification_blocks_when_required_unanswered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            _write_needs_human_case(root, artifact_dir)
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers_path = root / "answers.json"
+            answers_path.write_text(
+                json.dumps({"problem_id": "CASE-SYMBOLIC", "answers": [], "resolution_status": "answered"}),
+                encoding="utf-8",
+            )
+
+            exit_code = main(
+                [
+                    "answer-clarification",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--answers",
+                    str(answers_path),
+                    "--reviewer",
+                    "unit-test",
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            answers = json.loads(answers_path.read_text(encoding="utf-8"))
+            self.assertEqual(answers["resolution_status"], "partially_answered")
+
+    def test_solve_clarified_refuses_unanswered_required_questions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_needs_human_case(root, artifact_dir)
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers_path = root / "answers.json"
+            answers_path.write_text(
+                json.dumps({"problem_id": "CASE-SYMBOLIC", "answers": [], "resolution_status": "answered"}),
+                encoding="utf-8",
+            )
+
+            with patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent:
+                exit_code = main(
+                    [
+                        "solve-clarified",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--clarification",
+                        str(answers_path),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            self.assertFalse((resolution_dir / "summary.json").exists())
+
+    def test_solve_clarified_refuses_rejected_clarification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_needs_human_case(root, artifact_dir)
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers = _clarification_answers()
+            answers["resolution_status"] = "rejected"
+            answers_path = root / "answers.json"
+            answers_path.write_text(json.dumps(answers), encoding="utf-8")
+
+            with patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent:
+                exit_code = main(
+                    [
+                        "solve-clarified",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--clarification",
+                        str(answers_path),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            self.assertFalse((resolution_dir / "summary.json").exists())
+
+    def test_solve_clarified_uses_answers_and_does_not_overwrite_source_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_needs_human_case(root, artifact_dir)
+            original_summary = (artifact_dir / "summary.json").read_text(encoding="utf-8")
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers_path = root / "answers.json"
+            answers_path.write_text(json.dumps(_clarification_answers()), encoding="utf-8")
+            spec_calls = []
+
+            def fake_spec_agent(**kwargs):
+                spec_calls.append(kwargs)
+                return _agent_result(root, _valid_problem(kwargs["problem_id"]))
+
+            verification = VerificationResult(
+                returncode=0,
+                stdout="",
+                stderr="",
+                report={"classification": "SUCCESS", "status": "PASS", "checks": []},
+            )
+
+            with (
+                patch("or_llm_agent.cli._run_problem_spec_agent", fake_spec_agent),
+                patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+                patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
+            ):
+                exit_code = main(
+                    [
+                        "solve-clarified",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--clarification",
+                        str(answers_path),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual((artifact_dir / "summary.json").read_text(encoding="utf-8"), original_summary)
+            source_summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(source_summary["classification"], "blocked_capability")
+            clarified_summary = json.loads((resolution_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(clarified_summary["clarified_from"], str(artifact_dir.resolve()))
+            self.assertEqual(clarified_summary["clarification_status"], "answered")
+            self.assertEqual(clarified_summary["clarification_question_count"], 1)
+            self.assertEqual(clarified_summary["clarification_answer_count"], 1)
+            self.assertEqual(clarified_summary["clarification_gate_status"], "passed")
+            problem = json.loads((resolution_dir / "spec" / "problem.json").read_text(encoding="utf-8"))
+            self.assertTrue(problem["source_context"]["clarified"])
+            self.assertIn("clarification_context", spec_calls[0])
+            review = json.loads((resolution_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(review["clarification"]["clarification_gate_status"], "passed")
+            model_raw = (resolution_dir / "raw" / "CASE-SYMBOLIC.txt").read_text(encoding="utf-8")
+            self.assertEqual(model_raw, "generated model")
+
+    def test_prepare_clarification_batch_defaults_to_needs_human_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            _write_needs_human_case(root, batch_dir / "CASE-SYMBOLIC", problem_id="CASE-SYMBOLIC")
+            _write_blocked_case(
+                root,
+                batch_dir / "CASE-UNSUPPORTED",
+                problem_id="CASE-UNSUPPORTED",
+                capability={
+                    "status": "unsupported",
+                    "problem_family": "goal programming",
+                    "supported_features": [],
+                    "unsupported_features": ["goal programming"],
+                    "missing_information": [],
+                    "recommended_next_action": "extend_schema_or_verifier",
+                    "confidence": 0.9,
+                    "review_note": "Unsupported.",
+                },
+            )
+            rows = [
+                {
+                    "problem_id": "CASE-SYMBOLIC",
+                    "capability_status": "needs_human",
+                    "classification": "blocked_capability",
+                },
+                {
+                    "problem_id": "CASE-UNSUPPORTED",
+                    "capability_status": "unsupported",
+                    "classification": "blocked_capability",
+                },
+            ]
+            (batch_dir / "summary.json").write_text(json.dumps({"summary": {"total": 2}, "rows": rows}), encoding="utf-8")
+            calls = []
+
+            def fake_prepare(*, artifact_dir, out_path, args):
+                calls.append(artifact_dir.name)
+                payload = _clarification_questions(problem_id=artifact_dir.name)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(payload), encoding="utf-8")
+                return payload
+
+            with patch("or_llm_agent.cli.prepare_clarification_artifact", fake_prepare):
+                exit_code = main(["prepare-clarification-batch", "--artifact-dir", str(batch_dir)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(calls, ["CASE-SYMBOLIC"])
+            summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["summary"]["attempted_needs_human_count"], 1)
+
+    def test_solve_clarified_batch_defaults_to_needs_human_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            clarifications_dir = root / "answers"
+            clarifications_dir.mkdir()
+            _write_needs_human_case(root, batch_dir / "CASE-SYMBOLIC", problem_id="CASE-SYMBOLIC")
+            _write_blocked_case(
+                root,
+                batch_dir / "CASE-UNSUPPORTED",
+                problem_id="CASE-UNSUPPORTED",
+                capability={
+                    "status": "unsupported",
+                    "problem_family": "goal programming",
+                    "supported_features": [],
+                    "unsupported_features": ["goal programming"],
+                    "missing_information": [],
+                    "recommended_next_action": "extend_schema_or_verifier",
+                    "confidence": 0.9,
+                    "review_note": "Unsupported.",
+                },
+            )
+            rows = [
+                {
+                    "problem_id": "CASE-SYMBOLIC",
+                    "capability_status": "needs_human",
+                    "classification": "blocked_capability",
+                },
+                {
+                    "problem_id": "CASE-UNSUPPORTED",
+                    "capability_status": "unsupported",
+                    "classification": "blocked_capability",
+                },
+            ]
+            (batch_dir / "summary.json").write_text(json.dumps({"summary": {"total": 2}, "rows": rows}), encoding="utf-8")
+            (clarifications_dir / "CASE-SYMBOLIC.json").write_text(json.dumps(_clarification_answers()), encoding="utf-8")
+            calls = []
+
+            def fake_solve(*, artifact_dir, clarification_path, resolution_dir, args):
+                calls.append(artifact_dir.name)
+                return {
+                    "problem_id": artifact_dir.name,
+                    "source_artifact": str(artifact_dir),
+                    "resolution_artifact": str(resolution_dir),
+                    "clarified_from": str(artifact_dir),
+                    "clarification_status": "answered",
+                    "clarification_question_count": 1,
+                    "clarification_answer_count": 1,
+                    "clarification_source": "manual_review",
+                    "clarification_gate_status": "passed",
+                    "classification": "SUCCESS",
+                    "verification_status": "PASS",
+                    "spec_fidelity_status": "not_reviewed",
+                }
+
+            with patch("or_llm_agent.cli.solve_clarified_artifact", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-clarified-batch",
+                        "--artifact-dir",
+                        str(batch_dir),
+                        "--clarifications-dir",
+                        str(clarifications_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(calls, ["CASE-SYMBOLIC"])
+            summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["summary"]["clarified_supported_case_count"], 1)
+
+    def test_clarification_report_includes_question_set_and_answer_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+            resolution_dir = artifact_dir / "clarified" / "CASE-SYMBOLIC" / "attempt-1"
+            (resolution_dir / "clarification").mkdir(parents=True)
+            (resolution_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            (resolution_dir / "clarification" / "answers.json").write_text(
+                json.dumps(_clarification_answers()),
+                encoding="utf-8",
+            )
+            row = {
+                "problem_id": "CASE-SYMBOLIC",
+                "source_artifact": str(artifact_dir / "CASE-SYMBOLIC"),
+                "resolution_artifact": str(resolution_dir),
+                "clarified_from": str(artifact_dir / "CASE-SYMBOLIC"),
+                "clarification_status": "answered",
+                "clarification_question_count": 1,
+                "clarification_answer_count": 1,
+                "clarification_source": "manual_review",
+                "clarification_gate_status": "passed",
+                "clarification_questions": "clarification/questions.json",
+                "clarification_answers": "clarification/answers.json",
+                "classification": "SUCCESS",
+                "verification_status": "PASS",
+                "spec_fidelity_status": "not_reviewed",
+            }
+
+            from or_llm_agent.cli import _clarification_row_from_solve, summarize_clarification_rows, write_clarification_report
+
+            report_row = _clarification_row_from_solve(row, artifact_dir)
+            summary = summarize_clarification_rows([report_row])
+            report_path = root / "clarification-report.md"
+            write_clarification_report(report_path, summary, [report_row])
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Generated question set", report)
+            self.assertIn("What numeric truck costs should replace c_j?", report)
+            self.assertIn("Answer provenance", report)
+            self.assertIn("reviewer=`unit-test`", report)
+            self.assertEqual(summary["attempted_needs_human_count"], 1)
+            self.assertEqual(summary["generated_question_count"], 1)
+            self.assertEqual(summary["answered_question_count"], 1)
+            self.assertEqual(summary["clarified_supported_case_count"], 1)
+            self.assertEqual(summary["or_ci_statuses"]["PASS"], 1)
+            self.assertEqual(summary["fidelity_statuses"]["not_reviewed"], 1)
 
     def test_solve_writes_spec_fidelity_review_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -913,6 +1430,17 @@ def _review_agent_result(root: Path, payload: dict) -> FidelityReviewAgentResult
     )
 
 
+def _clarification_agent_result(root: Path, payload: dict) -> ClarificationAgentResult:
+    return ClarificationAgentResult(
+        raw_text=json.dumps(payload, indent=2),
+        returncode=0,
+        timed_out=False,
+        events_path=root / "clarification-events.jsonl",
+        last_message_path=root / "clarification-last-message.md",
+        stderr="",
+    )
+
+
 def _capability_agent_result(root: Path, payload: dict) -> CapabilityAgentResult:
     return CapabilityAgentResult(
         raw_text=json.dumps(payload, indent=2),
@@ -934,6 +1462,41 @@ def _supported_capability(problem_family: str = "linear programming") -> dict:
         "recommended_next_action": "continue_to_problemspec",
         "confidence": 0.95,
         "review_note": "Statement is within current OR-CI LP/MILP support.",
+    }
+
+
+def _clarification_questions(problem_id: str = "CASE-SYMBOLIC") -> dict:
+    return {
+        "problem_id": problem_id,
+        "source_artifact": "run",
+        "blocking_status": "needs_human",
+        "questions": [
+            {
+                "id": "q1",
+                "issue_type": "missing_numeric_data",
+                "prompt": "What numeric truck costs should replace c_j?",
+                "source_evidence": "The statement uses symbolic truck costs c_j.",
+                "allowed_answer_type": "free_text",
+                "options": [],
+                "required": True,
+            }
+        ],
+    }
+
+
+def _clarification_answers(problem_id: str = "CASE-SYMBOLIC", reviewer: str = "unit-test") -> dict:
+    return {
+        "problem_id": problem_id,
+        "answers": [
+            {
+                "question_id": "q1",
+                "answer": "Use costs 10, 12, and 14 for trucks 1, 2, and 3.",
+                "reviewer": reviewer,
+                "rationale": "Manual review supplied the omitted numeric costs.",
+                "source": "manual_review",
+            }
+        ],
+        "resolution_status": "answered",
     }
 
 
@@ -1028,6 +1591,52 @@ def _write_solved_case(
     expected = 0 if verification.returncode == 0 else 1
     if exit_code != expected:
         raise AssertionError(f"unexpected solve exit code: {exit_code}")
+
+
+def _write_needs_human_case(root: Path, artifact_dir: Path, *, problem_id: str = "CASE-SYMBOLIC") -> None:
+    capability = {
+        "status": "needs_human",
+        "problem_family": "assignment",
+        "supported_features": ["linear assignment structure"],
+        "unsupported_features": [],
+        "missing_information": ["numeric truck costs c_j are not provided"],
+        "recommended_next_action": "ask_human",
+        "confidence": 0.9,
+        "review_note": "Symbolic objective coefficients require clarification.",
+    }
+    _write_blocked_case(root, artifact_dir, problem_id=problem_id, capability=capability)
+
+
+def _write_blocked_case(
+    root: Path,
+    artifact_dir: Path,
+    *,
+    problem_id: str,
+    capability: dict,
+    statement: str = "Use trucks with symbolic costs c_j.",
+) -> None:
+    statement_path = root / f"{problem_id}.txt"
+    statement_path.write_text(statement, encoding="utf-8")
+    with (
+        patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, capability)),
+        patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent,
+    ):
+        exit_code = main(
+            [
+                "solve",
+                "--mode",
+                "agent",
+                "--statement-file",
+                str(statement_path),
+                "--problem-id",
+                problem_id,
+                "--artifact-dir",
+                str(artifact_dir),
+            ]
+        )
+    if exit_code != 1:
+        raise AssertionError(f"unexpected blocked solve exit code: {exit_code}")
+    run_problem_spec_agent.assert_not_called()
 
 
 def _valid_problem(problem_id: str = "CASE-001") -> dict:
