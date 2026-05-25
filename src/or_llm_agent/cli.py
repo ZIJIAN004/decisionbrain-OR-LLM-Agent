@@ -759,10 +759,8 @@ def answer_clarification_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     questions = load_clarification_questions(_canonical_clarification_questions_path(artifact_dir))
     answers = load_clarification_answers(args.answers.resolve(), questions=questions, reviewer=args.reviewer)
-    _write_clarification_artifact(args.answers.resolve(), answers)
     canonical_answers = _canonical_clarification_answers_path(artifact_dir)
-    if canonical_answers.resolve() != args.answers.resolve():
-        _write_clarification_artifact(canonical_answers, answers)
+    _write_clarification_artifact(canonical_answers, answers)
     gate_status = _clarification_gate_status(questions, answers)
     print(
         f"{answers['problem_id']}: clarification_status={answers['resolution_status']} "
@@ -997,7 +995,7 @@ def prepare_clarification_artifact(
     parsed = extract_json_object(agent_result.raw_text)
     if isinstance(parsed, dict):
         parsed["problem_id"] = problem_id
-        parsed["source_artifact"] = str(artifact_dir)
+        parsed["source_artifact"] = _portable_source_artifact(artifact_dir)
         parsed["blocking_status"] = "needs_human"
         payload = normalize_clarification_questions(parsed, source_path=out_path)
     else:
@@ -1029,6 +1027,12 @@ def solve_clarified_artifact(
     resolution_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    if resolution_dir.resolve() == artifact_dir.resolve():
+        raise CLIError(
+            "solve-clarified requires --resolution-dir to be different from --artifact-dir "
+            f"so the blocked source artifact is preserved: {artifact_dir}"
+        )
+
     source_summary = _read_json_object(artifact_dir / "summary.json")
     if not source_summary:
         raise CLIError(f"solve summary does not exist or is not valid JSON: {artifact_dir / 'summary.json'}")
@@ -1820,6 +1824,8 @@ def _capability_summary_fields(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_clarification_questions(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise CLIError(f"clarification question artifact does not exist: {path}; run prepare-clarification first")
     return normalize_clarification_questions(_read_json_object(path), source_path=path)
 
 
@@ -1903,6 +1909,8 @@ def load_clarification_answers(
     questions: dict[str, Any],
     reviewer: str | None = None,
 ) -> dict[str, Any]:
+    if not path.is_file():
+        raise CLIError(f"clarification answer artifact does not exist: {path}")
     payload = _read_json_object(path)
     if not payload:
         raise CLIError(f"clarification answer artifact is not a JSON object: {path}")
@@ -2091,7 +2099,7 @@ def _fallback_clarification_questions(
         )
     return {
         "problem_id": problem_id,
-        "source_artifact": str(artifact_dir),
+        "source_artifact": _portable_source_artifact(artifact_dir),
         "blocking_status": "needs_human",
         "questions": questions,
         "raw_response": str(raw_path),
@@ -4055,6 +4063,10 @@ def _relative(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def _portable_source_artifact(path: Path) -> str:
+    return _relative(path.resolve(), repo_root())
 
 
 if __name__ == "__main__":

@@ -143,12 +143,14 @@ uv run or-ci validate-spec --problem <problem.json>
   `modeling_convention`. Supported answer artifact `resolution_status` values
   are `answered`, `partially_answered`, `rejected`, and `unresolved`.
 - `answer-clarification` validates an answer artifact against canonical
-  questions, stamps missing per-answer reviewer fields from `--reviewer`, writes
-  the normalized answer artifact, and keeps a canonical copy at
-  `<case-dir>/clarification/answers.json`. If required questions remain
-  unanswered, the command records `resolution_status=partially_answered` and
-  returns nonzero.
-- `solve-clarified` does not overwrite the original blocked artifact. It
+  questions, stamps missing per-answer reviewer fields from `--reviewer`, and
+  writes the normalized canonical copy at
+  `<case-dir>/clarification/answers.json` without modifying an external
+  `--answers` file. If `--answers` already points at the canonical copy, it is
+  normalized in place. If required questions remain unanswered, the command
+  records `resolution_status=partially_answered` and returns nonzero.
+- `solve-clarified` does not overwrite the original blocked artifact and refuses
+  `--resolution-dir` values that resolve to the source `--artifact-dir`. It
   requires answered required clarification questions, writes a separate
   clarified solve artifact under `--resolution-dir`, passes the original
   statement plus approved clarification answers to ProblemSpec generation and

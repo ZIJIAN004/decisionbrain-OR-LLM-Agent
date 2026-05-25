@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from or_llm_agent.cli import (
     CapabilityAgentResult,
+    CLIError,
     ClarificationAgentResult,
     FidelityReviewAgentResult,
     ProblemSpecAgentResult,
@@ -384,8 +385,40 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             payload["questions"][0]["issue_type"] = "guess_anyway"
             path.write_text(json.dumps(payload), encoding="utf-8")
 
-            with self.assertRaisesRegex(Exception, "unsupported clarification issue_type"):
+            with self.assertRaisesRegex(CLIError, "unsupported clarification issue_type"):
                 load_clarification_questions(path)
+
+    def test_clarification_question_schema_rejects_malformed_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base = _clarification_questions()
+            cases = [
+                ("empty-questions.json", {**base, "questions": []}, "non-empty questions list"),
+                ("bad-status.json", {**base, "blocking_status": "supported"}, "blocking_status must be needs_human"),
+                (
+                    "bad-required.json",
+                    {**base, "questions": [{**base["questions"][0], "required": "true"}]},
+                    "required must be boolean",
+                ),
+            ]
+
+            for filename, payload, pattern in cases:
+                with self.subTest(filename=filename):
+                    path = root / filename
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+
+                    with self.assertRaisesRegex(CLIError, pattern):
+                        load_clarification_questions(path)
+
+    def test_clarification_loaders_report_missing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            with self.assertRaisesRegex(CLIError, "run prepare-clarification first"):
+                load_clarification_questions(root / "missing-questions.json")
+
+            with self.assertRaisesRegex(CLIError, "clarification answer artifact does not exist"):
+                load_clarification_answers(root / "missing-answers.json", questions=_clarification_questions())
 
     def test_clarification_answer_schema_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -418,6 +451,44 @@ class ProblemSpecGenerationTests(unittest.TestCase):
 
             self.assertEqual(answers["resolution_status"], "partially_answered")
 
+    def test_clarification_answer_schema_rejects_malformed_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            questions_path = root / "questions.json"
+            questions_path.write_text(json.dumps(_clarification_questions()), encoding="utf-8")
+            questions = load_clarification_questions(questions_path)
+            valid_answer = _clarification_answers()["answers"][0]
+            cases = [
+                (
+                    "unknown-question.json",
+                    {"problem_id": "CASE-SYMBOLIC", "answers": [{**valid_answer, "question_id": "q-missing"}]},
+                    "unknown question_id",
+                ),
+                (
+                    "missing-answer.json",
+                    {"problem_id": "CASE-SYMBOLIC", "answers": [{"question_id": "q1", "reviewer": "unit-test"}]},
+                    "is empty",
+                ),
+                (
+                    "bad-status.json",
+                    {"problem_id": "CASE-SYMBOLIC", "answers": [], "resolution_status": "guessed"},
+                    "unsupported clarification resolution_status",
+                ),
+                (
+                    "wrong-problem.json",
+                    {"problem_id": "CASE-OTHER", "answers": [valid_answer], "resolution_status": "answered"},
+                    "does not match questions problem_id",
+                ),
+            ]
+
+            for filename, payload, pattern in cases:
+                with self.subTest(filename=filename):
+                    answers_path = root / filename
+                    answers_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                    with self.assertRaisesRegex(CLIError, pattern):
+                        load_clarification_answers(answers_path, questions=questions)
+
     def test_clarification_prompts_document_required_contracts(self) -> None:
         question_prompt = build_clarification_question_prompt(
             "CASE-SYMBOLIC",
@@ -444,9 +515,12 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             out_path = root / "questions.json"
             payload = _clarification_questions()
 
-            with patch(
-                "or_llm_agent.cli._run_clarification_question_agent",
-                return_value=_clarification_agent_result(root, payload),
+            with (
+                patch("or_llm_agent.cli.repo_root", return_value=root.resolve()),
+                patch(
+                    "or_llm_agent.cli._run_clarification_question_agent",
+                    return_value=_clarification_agent_result(root, payload),
+                ),
             ):
                 exit_code = main(
                     [
@@ -461,9 +535,46 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             written = json.loads(out_path.read_text(encoding="utf-8"))
             self.assertEqual(written["questions"][0]["id"], "q1")
+            self.assertEqual(written["source_artifact"], "run")
             self.assertTrue((artifact_dir / "clarification" / "questions.json").exists())
             summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["classification"], "blocked_capability")
+
+    def test_prepare_clarification_refuses_non_needs_human_source_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            out_path = root / "questions.json"
+            _write_blocked_case(
+                root,
+                artifact_dir,
+                problem_id="CASE-UNSUPPORTED",
+                capability={
+                    "status": "unsupported",
+                    "problem_family": "goal programming",
+                    "supported_features": [],
+                    "unsupported_features": ["goal programming"],
+                    "missing_information": [],
+                    "recommended_next_action": "extend_schema_or_verifier",
+                    "confidence": 0.9,
+                    "review_note": "Unsupported.",
+                },
+            )
+
+            with patch("or_llm_agent.cli._run_clarification_question_agent") as run_agent:
+                exit_code = main(
+                    [
+                        "prepare-clarification",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--out",
+                        str(out_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_agent.assert_not_called()
+            self.assertFalse(out_path.exists())
 
     def test_prepare_clarification_golden_bwor_ambiguity_classes(self) -> None:
         cases = [
@@ -552,6 +663,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
                 json.dumps({"problem_id": "CASE-SYMBOLIC", "answers": [], "resolution_status": "answered"}),
                 encoding="utf-8",
             )
+            original_answers = answers_path.read_text(encoding="utf-8")
 
             exit_code = main(
                 [
@@ -566,7 +678,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 1)
-            answers = json.loads(answers_path.read_text(encoding="utf-8"))
+            self.assertEqual(answers_path.read_text(encoding="utf-8"), original_answers)
+            answers = json.loads((artifact_dir / "clarification" / "answers.json").read_text(encoding="utf-8"))
             self.assertEqual(answers["resolution_status"], "partially_answered")
 
     def test_solve_clarified_refuses_unanswered_required_questions(self) -> None:
@@ -636,6 +749,74 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             run_problem_spec_agent.assert_not_called()
             self.assertFalse((resolution_dir / "summary.json").exists())
 
+    def test_solve_clarified_refuses_unresolved_clarification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            resolution_dir = root / "resolved"
+            _write_needs_human_case(root, artifact_dir)
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers = _clarification_answers()
+            answers["resolution_status"] = "unresolved"
+            answers_path = root / "answers.json"
+            answers_path.write_text(json.dumps(answers), encoding="utf-8")
+
+            with patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent:
+                exit_code = main(
+                    [
+                        "solve-clarified",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--clarification",
+                        str(answers_path),
+                        "--resolution-dir",
+                        str(resolution_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            self.assertFalse((resolution_dir / "summary.json").exists())
+
+    def test_solve_clarified_refuses_source_artifact_as_resolution_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "run"
+            _write_needs_human_case(root, artifact_dir)
+            original_summary = (artifact_dir / "summary.json").read_text(encoding="utf-8")
+            original_capability = (artifact_dir / "spec" / "capability.json").read_text(encoding="utf-8")
+            original_raw = (artifact_dir / "raw" / "capability.txt").read_text(encoding="utf-8")
+            (artifact_dir / "clarification").mkdir(parents=True)
+            (artifact_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            answers_path = root / "answers.json"
+            answers_path.write_text(json.dumps(_clarification_answers()), encoding="utf-8")
+
+            with patch("or_llm_agent.cli._run_problem_spec_agent") as run_problem_spec_agent:
+                exit_code = main(
+                    [
+                        "solve-clarified",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--clarification",
+                        str(answers_path),
+                        "--resolution-dir",
+                        str(artifact_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            run_problem_spec_agent.assert_not_called()
+            self.assertEqual((artifact_dir / "summary.json").read_text(encoding="utf-8"), original_summary)
+            self.assertEqual((artifact_dir / "spec" / "capability.json").read_text(encoding="utf-8"), original_capability)
+            self.assertEqual((artifact_dir / "raw" / "capability.txt").read_text(encoding="utf-8"), original_raw)
+
     def test_solve_clarified_uses_answers_and_does_not_overwrite_source_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -643,6 +824,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             resolution_dir = root / "resolved"
             _write_needs_human_case(root, artifact_dir)
             original_summary = (artifact_dir / "summary.json").read_text(encoding="utf-8")
+            original_capability = (artifact_dir / "spec" / "capability.json").read_text(encoding="utf-8")
+            original_raw = (artifact_dir / "raw" / "capability.txt").read_text(encoding="utf-8")
             (artifact_dir / "clarification").mkdir(parents=True)
             (artifact_dir / "clarification" / "questions.json").write_text(
                 json.dumps(_clarification_questions()),
@@ -682,6 +865,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual((artifact_dir / "summary.json").read_text(encoding="utf-8"), original_summary)
+            self.assertEqual((artifact_dir / "spec" / "capability.json").read_text(encoding="utf-8"), original_capability)
+            self.assertEqual((artifact_dir / "raw" / "capability.txt").read_text(encoding="utf-8"), original_raw)
             source_summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(source_summary["classification"], "blocked_capability")
             clarified_summary = json.loads((resolution_dir / "summary.json").read_text(encoding="utf-8"))
@@ -745,6 +930,7 @@ class ProblemSpecGenerationTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(calls, ["CASE-SYMBOLIC"])
+            self.assertTrue((batch_dir / "clarification-report.md").exists())
             summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["summary"]["attempted_needs_human_count"], 1)
 
@@ -818,6 +1004,48 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(calls, ["CASE-SYMBOLIC"])
             summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["summary"]["clarified_supported_case_count"], 1)
+
+    def test_solve_clarified_batch_records_unresolved_row_when_answer_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            clarifications_dir = root / "answers"
+            clarifications_dir.mkdir()
+            case_dir = batch_dir / "CASE-SYMBOLIC"
+            _write_needs_human_case(root, case_dir, problem_id="CASE-SYMBOLIC")
+            (case_dir / "clarification").mkdir(parents=True)
+            (case_dir / "clarification" / "questions.json").write_text(
+                json.dumps(_clarification_questions()),
+                encoding="utf-8",
+            )
+            rows = [
+                {
+                    "problem_id": "CASE-SYMBOLIC",
+                    "capability_status": "needs_human",
+                    "classification": "blocked_capability",
+                }
+            ]
+            (batch_dir / "summary.json").write_text(json.dumps({"summary": {"total": 1}, "rows": rows}), encoding="utf-8")
+
+            exit_code = main(
+                [
+                    "solve-clarified-batch",
+                    "--artifact-dir",
+                    str(batch_dir),
+                    "--clarifications-dir",
+                    str(clarifications_dir),
+                ]
+            )
+
+            self.assertEqual(exit_code, 1)
+            payload = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["summary"]["unresolved_case_count"], 1)
+            self.assertEqual(payload["summary"]["classifications"]["blocked_clarification"], 1)
+            self.assertEqual(payload["summary"]["clarification_statuses"]["unresolved"], 1)
+            self.assertEqual(payload["rows"][0]["clarification_gate_status"], "blocked")
+            self.assertIn("does not exist", payload["rows"][0]["error"])
+            report = (batch_dir / "clarification-report.md").read_text(encoding="utf-8")
+            self.assertIn("CASE-SYMBOLIC", report)
 
     def test_clarification_report_includes_question_set_and_answer_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
