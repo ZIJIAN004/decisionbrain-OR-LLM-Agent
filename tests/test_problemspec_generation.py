@@ -8,6 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from or_llm_agent.bwor import (
+    BWOR_RUN_DATASET_KEYS,
+    build_bwor_run_records,
+    load_bwor_run_record,
+)
 from or_llm_agent.cli import (
     CapabilityAgentResult,
     CLIError,
@@ -22,6 +27,7 @@ from or_llm_agent.or_ci import VerificationResult
 from or_llm_agent.prompts import (
     build_clarification_question_prompt,
     build_clarified_problem_spec_prompt,
+    build_or_ci_prompt,
     build_problem_metadata_template,
     build_problem_spec_prompt,
     build_statement_capability_prompt,
@@ -69,6 +75,9 @@ class ProblemSpecGenerationTests(unittest.TestCase):
         self.assertIn("unsupported", prompt)
         self.assertIn("symbolic coefficients", prompt)
         self.assertIn("goal-programming", prompt)
+        self.assertIn("QP/MIQP", prompt)
+        self.assertIn("multi-scenario", prompt)
+        self.assertIn("quadratic constraints", prompt)
         self.assertIn("Do not generate a ProblemSpec", prompt)
 
     def test_problem_spec_prompt_documents_constraint_relaxation_schema(self) -> None:
@@ -80,6 +89,51 @@ class ProblemSpecGenerationTests(unittest.TestCase):
         self.assertIn("do not use `path`, `amount`, or `direction`", prompt)
         self.assertIn("Preserve primitive statement quantities", prompt)
         self.assertIn("profit and transport cost", prompt)
+
+    def test_problem_spec_prompt_documents_feature_family_schema(self) -> None:
+        prompt = build_problem_spec_prompt("CASE-001", "A quadratic objective goal-programming case.")
+
+        self.assertIn("`LP`, `MILP`, `QP`, `MIQP`, `MULTI_SCENARIO`", prompt)
+        self.assertIn("metamorphic.goal_programming", prompt)
+        self.assertIn('mode: "weighted"', prompt)
+        self.assertIn('mode: "lexicographic"', prompt)
+        self.assertIn("scenarios[]", prompt)
+        self.assertIn("do not collapse those outcomes into one blended model", prompt)
+        self.assertIn("expected_solver_status", prompt)
+        self.assertIn("quadratic constraints remain unsupported", prompt)
+        self.assertIn("Do not include dataset labels", prompt)
+
+    def test_or_ci_prompt_uses_only_statement_from_dataset_record(self) -> None:
+        prompt = build_or_ci_prompt(
+            "CASE-001",
+            {
+                "id": "CASE-001",
+                "en_question": "Visible statement text.",
+                "answer": 999999,
+                "problem_type": "NLP",
+                "difficulty": "Hard",
+                "domain": "secret_domain",
+                "solution_status": "optimal",
+            },
+            _valid_problem(),
+        )
+
+        self.assertIn("Visible statement text.", prompt)
+        self.assertNotIn("999999", prompt)
+        self.assertNotIn("secret_domain", prompt)
+        self.assertNotIn("Hard", prompt)
+        self.assertNotIn("solution_status", prompt)
+
+    def test_or_ci_prompt_documents_multi_scenario_metadata(self) -> None:
+        prompt = build_or_ci_prompt(
+            "CASE-SCENARIO",
+            {"id": "CASE-SCENARIO", "en_question": "Check base and repair scenarios."},
+            _multi_scenario_problem(),
+        )
+
+        self.assertIn("OR-CI multi-scenario metadata", prompt)
+        self.assertIn("base_infeasible", prompt)
+        self.assertIn("For `MULTI_SCENARIO`, OR-CI calls `build_model(data)` once per scenario", prompt)
 
     def test_problem_metadata_template_uses_requested_problem_id(self) -> None:
         template = json.loads(build_problem_metadata_template("CASE-123"))
@@ -1375,6 +1429,92 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(batch["summary"]["succeeded"], 12)
             self.assertEqual([row["problem_id"] for row in batch["rows"]], problem_ids)
 
+    def test_bwor_run_dataset_builder_keeps_only_statement_and_answer_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "bwor.jsonl"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "id": "BWOR-001",
+                        "en_question": "Statement only.",
+                        "cn_question": "Chinese statement.",
+                        "answer": 12.5,
+                        "solution_status": "optimal",
+                        "domain": "finance",
+                        "problem_type": "LP",
+                        "difficulty": "Medium",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = build_bwor_run_records(source_path)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(tuple(records[0].keys()), BWOR_RUN_DATASET_KEYS)
+            self.assertEqual(records[0]["id"], "BWOR-001")
+            self.assertEqual(records[0]["en_question"], "Statement only.")
+            self.assertEqual(records[0]["answer"], 12.5)
+
+    def test_bwor_run_dataset_rejects_extra_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_path = root / "bwor_run.jsonl"
+            run_path.write_text(
+                json.dumps(
+                    {
+                        "id": "BWOR-001",
+                        "en_question": "Statement only.",
+                        "answer": 12.5,
+                        "problem_type": "LP",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "extra keys: problem_type"):
+                load_bwor_run_record(run_path, "BWOR-001")
+
+    def test_solve_batch_rejects_non_run_dataset_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_path = root / "bwor.jsonl"
+            artifact_dir = root / "batch"
+            dataset_path.write_text(
+                json.dumps(
+                    {
+                        "id": "BWOR-001",
+                        "en_question": "Statement only.",
+                        "answer": 12.5,
+                        "problem_type": "LP",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("or_llm_agent.cli.solve_command") as solve_command:
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "BWOR-001",
+                        "--dataset",
+                        str(dataset_path),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            solve_command.assert_not_called()
+            self.assertFalse((artifact_dir / "summary.json").exists())
+
     def test_solve_batch_rejects_invalid_agent_concurrency_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1702,6 +1842,67 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(batch["summary"]["spec_fidelity_gate_statuses"]["accepted"], 2)
             self.assertEqual(batch["rows"][0]["spec_fidelity_status"], "accepted")
             self.assertIn("accepted", (artifact_dir / "report.md").read_text(encoding="utf-8"))
+
+    def test_review_fidelity_batch_with_ids_preserves_unreviewed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+            statements_dir = artifact_dir / "statements"
+            statements_dir.mkdir(parents=True)
+            for problem_id in ("CASE-001", "CASE-002"):
+                _write_solved_case(
+                    root,
+                    statements_dir / f"{problem_id}.txt",
+                    artifact_dir / problem_id,
+                    problem_id=problem_id,
+                )
+            rows = [
+                {
+                    "problem_id": problem_id,
+                    "exit_code": 0,
+                    "artifact_dir": problem_id,
+                    "statement_file": f"statements/{problem_id}.txt",
+                    "spec_validation_status": "passed",
+                    "spec_attempt_count": 1,
+                    "spec_repair_status": "not_needed",
+                    "model_generation_status": "generated",
+                    "verification_status": "PASS",
+                    "classification": "SUCCESS",
+                    "spec_fidelity_status": "not_reviewed",
+                    "spec_fidelity_gate_status": "manual_review_required",
+                }
+                for problem_id in ("CASE-001", "CASE-002")
+            ]
+            (artifact_dir / "summary.json").write_text(
+                json.dumps({"summary": {"total": 2}, "rows": rows}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            exit_code = main(
+                [
+                    "review-fidelity-batch",
+                    "--artifact-dir",
+                    str(artifact_dir),
+                    "--ids",
+                    "CASE-001",
+                    "--status",
+                    "accepted",
+                    "--reviewer",
+                    "unit-test",
+                    "--note",
+                    "Manual subset review accepted.",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch["summary"]["total"], 2)
+            self.assertEqual(batch["summary"]["spec_fidelity_statuses"]["accepted"], 1)
+            self.assertEqual(batch["summary"]["spec_fidelity_statuses"]["not_reviewed"], 1)
+            self.assertEqual([row["problem_id"] for row in batch["rows"]], ["CASE-001", "CASE-002"])
+            row_by_id = {row["problem_id"]: row for row in batch["rows"]}
+            self.assertEqual(row_by_id["CASE-001"]["spec_fidelity_status"], "accepted")
+            self.assertEqual(row_by_id["CASE-002"]["spec_fidelity_status"], "not_reviewed")
 
     def test_resolve_fidelity_repairs_rejected_case(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2171,6 +2372,32 @@ def _valid_problem(problem_id: str = "CASE-001") -> dict:
                 "tolerance_rel": 1e-6,
             }
         },
+    }
+
+
+def _multi_scenario_problem(problem_id: str = "CASE-SCENARIO") -> dict:
+    return {
+        "id": problem_id,
+        "problem_type": "MULTI_SCENARIO",
+        "scenarios": [
+            {
+                "name": "base_infeasible",
+                "instance": {"case": "base"},
+                "expected_solver_status": "INFEASIBLE",
+            },
+            {
+                "name": "repair_feasible",
+                "instance": {"case": "repair", "objective": 10.0},
+                "expected_solver_status": "OPTIMAL",
+                "objective": {"value": 10.0},
+                "metamorphic": {
+                    "cost_scaling": {
+                        "coefficient_paths": ["instance.objective"],
+                        "factors": [2.0],
+                    }
+                },
+            },
+        ],
     }
 
 

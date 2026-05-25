@@ -71,6 +71,80 @@ class CodexAgentModeTests(unittest.TestCase):
             self.assertIn("Start now. Complete the workflow without asking for confirmation.", prompt)
             self.assertIn("Do not run cleanup or removal commands", prompt)
 
+    def test_prompt_does_not_leak_dataset_labels_or_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = _paths(Path(temp_dir), "BWOR-001")
+            options = CodexAgentOptions(
+                codex_model=None,
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                max_repair_attempts=2,
+                timeout_seconds=30,
+            )
+
+            prompt = build_agent_prompt(
+                problem_id="BWOR-001",
+                record={
+                    "en_question": "Build a tiny LP.",
+                    "answer": 123456789,
+                    "problem_type": "LP",
+                    "difficulty": "Medium",
+                    "domain": "hidden_domain",
+                    "solution_status": "optimal",
+                },
+                problem={"instance": {"sets": ["x"]}, "metamorphic": {}},
+                problem_path=Path("/tmp/problem.json"),
+                paths=paths,
+                options=options,
+                verify_command=["python", "-m", "or_ci.cli"],
+            )
+
+            self.assertIn("Build a tiny LP.", prompt)
+            self.assertNotIn("123456789", prompt)
+            self.assertNotIn("hidden_domain", prompt)
+            self.assertNotIn("Medium", prompt)
+            self.assertNotIn("solution_status", prompt)
+
+    def test_prompt_documents_multi_scenario_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = _paths(Path(temp_dir), "BWOR-032")
+            options = CodexAgentOptions(
+                codex_model=None,
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                max_repair_attempts=2,
+                timeout_seconds=30,
+            )
+
+            prompt = build_agent_prompt(
+                problem_id="BWOR-032",
+                record={"en_question": "Check base infeasible and repair feasible scenarios."},
+                problem={
+                    "problem_type": "MULTI_SCENARIO",
+                    "scenarios": [
+                        {
+                            "name": "base_infeasible",
+                            "instance": {"case": "base"},
+                            "expected_solver_status": "INFEASIBLE",
+                        },
+                        {
+                            "name": "repair_feasible",
+                            "instance": {"case": "repair", "objective": 10.0},
+                            "expected_solver_status": "OPTIMAL",
+                            "objective": {"value": 10.0},
+                        },
+                    ],
+                },
+                problem_path=Path("/tmp/problem.json"),
+                paths=paths,
+                options=options,
+                verify_command=["python", "-m", "or_ci.cli"],
+            )
+
+            self.assertIn("OR-CI multi-scenario metadata", prompt)
+            self.assertIn("base_infeasible", prompt)
+            self.assertIn("calls `build_model(data)` once per scenario", prompt)
+
     def test_run_codex_agent_harvests_fallback_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = _paths(Path(temp_dir), "BWOR-001")

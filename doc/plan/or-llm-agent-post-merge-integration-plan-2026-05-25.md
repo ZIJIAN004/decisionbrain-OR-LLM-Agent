@@ -32,10 +32,20 @@ root is:
 /Users/zhangbowen/Projects/OR/code/or-ci/artifacts/pilot/or-ci-feature-family-extensions-2026-05-23/
 ```
 
-The remaining integration gap is on the OR-LLM-Agent side. Its statement
-capability prompt and ProblemSpec-generation prompt still describe the main
-supported surface as linear LP/MILP and still treat several newly supported
+The original integration gap was on the OR-LLM-Agent side: its statement
+capability prompt and ProblemSpec-generation prompt still described the main
+supported surface as linear LP/MILP and still treated several newly supported
 families as unsupported.
+
+Implementation update on 2026-05-25:
+
+- `solve-batch` now defaults to a clean BWOR run dataset.
+- Prompt builders are covered by regression tests that prevent leaking
+  evaluator answers or analysis labels.
+- Capability and ProblemSpec prompts now describe QP/MIQP quadratic-objective,
+  goal-programming, and multi-scenario metadata contracts.
+- Model-generation prompts now render multi-scenario metadata without assuming
+  a top-level `instance`.
 
 ## Merge Verification Gate
 
@@ -114,6 +124,8 @@ and verification.
 6. Run targeted statement-only pilots on the recovered feature-extension cases.
 7. Run a larger 50-case or 82-case pilot after targeted cases pass.
 
+Tasks 1-6 have been implemented or run. Task 7 remains pending.
+
 ## Pilot Order
 
 Use this sequence:
@@ -136,13 +148,15 @@ Use this sequence:
 
 - [x] Claude review completed or explicitly deferred.
 - [x] `feature/needs-human-clarification-workflow` merged cleanly.
-- [ ] Unit tests pass after merge.
-- [ ] CLI help smoke checks pass after merge.
-- [ ] `bwor_run.jsonl` exists with only `id`, `en_question`, and `answer`.
-- [ ] Prompt builders are tested against leaking `answer` or dataset labels.
-- [ ] Capability prompt lists newly supported OR-CI feature families.
-- [ ] ProblemSpec prompt can produce metadata for the new feature families.
-- [ ] Targeted feature-family statement-only pilot passes.
+- [x] Unit tests pass after merge.
+- [x] CLI help smoke checks pass after merge.
+- [x] `bwor_run.jsonl` exists with only `id`, `en_question`, and `answer`.
+- [x] Prompt builders are tested against leaking `answer` or dataset labels.
+- [x] Capability prompt lists newly supported OR-CI feature families.
+- [x] ProblemSpec prompt can produce metadata for the new feature families.
+- [x] Targeted feature-family statement-only pilot completed; QP/MIQP and
+      multi-scenario supported cases passed OR-CI, while underspecified
+      goal-programming statements correctly remained `needs_human`.
 - [ ] Clarification pilot report is generated.
 - [ ] Next 50-case or 82-case report separates verifier pass, source-fidelity
       pass, clarification recovery, and evaluator answer accuracy.
@@ -159,3 +173,29 @@ The next report should include:
 - source-fidelity outcomes
 - answer scoring as a post-hoc evaluator-only metric
 - remaining unsupported families and why they are intentional limits
+
+## Pilot Result
+
+Targeted six-case run:
+
+```text
+/Users/zhangbowen/Projects/OR/code/or-ci/artifacts/pilot/or-llm-agent-feature-family-integration-2026-05-25/
+```
+
+Result:
+
+- `BWOR-012`: `needs_human`, blocked before ProblemSpec generation.
+- `BWOR-014`: `needs_human`, blocked before ProblemSpec generation.
+- `BWOR-015`: `needs_human`, blocked before ProblemSpec generation.
+- `BWOR-032`: `SUCCESS` / `PASS`.
+- `BWOR-067`: `SUCCESS` / `PASS`.
+- `BWOR-071`: `SUCCESS` / `PASS`.
+
+Follow-up `BWOR-032` rerun after tightening the multi-scenario prompt:
+
+```text
+/Users/zhangbowen/Projects/OR/code/or-ci/artifacts/pilot/or-llm-agent-feature-family-integration-2026-05-25-bwor032-rerun/
+```
+
+The rerun generated `problem_type: "MULTI_SCENARIO"` with two required
+scenarios and OR-CI reported `PASS` / `SUCCESS`.

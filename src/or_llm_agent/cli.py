@@ -15,9 +15,11 @@ from dotenv import load_dotenv
 
 from or_llm_agent.bwor import (
     default_bwor_dataset,
+    default_bwor_run_dataset,
     default_or_ci_root,
     default_problem_path,
     load_bwor_record,
+    load_bwor_run_record,
     load_problem,
     repo_root,
 )
@@ -268,7 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     solve_batch.add_argument("--ids", required=True, nargs="+")
     solve_batch.add_argument("--artifact-dir", required=True, type=Path)
     solve_batch.add_argument("--statements-dir", type=Path, help="directory containing <problem-id>.txt statement files")
-    solve_batch.add_argument("--dataset", default=default_bwor_dataset(), type=Path)
+    solve_batch.add_argument(
+        "--dataset",
+        default=default_bwor_run_dataset(),
+        type=Path,
+        help="clean BWOR run JSONL with exactly id, en_question, answer",
+    )
     solve_batch.add_argument("--model", default="o3-mini")
     solve_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
     solve_batch.add_argument(
@@ -952,12 +959,13 @@ def review_fidelity_command(args: argparse.Namespace) -> int:
 
 def review_fidelity_batch_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
-    ids = args.ids or _batch_ids_from_summary(artifact_dir)
-    for problem_id in ids:
+    review_ids = args.ids or _batch_ids_from_summary(artifact_dir)
+    for problem_id in review_ids:
         case_dir = artifact_dir / problem_id
         review = _fidelity_review_payload_for_artifact(case_dir, args)
         apply_fidelity_review(artifact_dir=case_dir, review=review)
 
+    aggregate_ids = _batch_ids_for_aggregate(artifact_dir, fallback_ids=review_ids)
     rows = [
         _solve_batch_row(
             problem_id=problem_id,
@@ -966,14 +974,14 @@ def review_fidelity_batch_command(args: argparse.Namespace) -> int:
             case_dir=artifact_dir / problem_id,
             statement_path=artifact_dir / "statements" / f"{problem_id}.txt",
         )
-        for problem_id in ids
+        for problem_id in aggregate_ids
     ]
     summary = summarize_solve_batch(rows)
     payload = {"summary": summary, "rows": rows}
     _write_summary(artifact_dir / "summary.json", payload)
-    report_args = argparse.Namespace(ids=ids, mode="agent")
+    report_args = argparse.Namespace(ids=aggregate_ids, mode="agent")
     write_solve_batch_report(artifact_dir / "report.md", report_args, summary, rows)
-    print(f"reviewed {len(ids)} case(s); wrote {artifact_dir / 'report.md'}")
+    print(f"reviewed {len(review_ids)} case(s); wrote {artifact_dir / 'report.md'}")
     return 0
 
 
@@ -2634,7 +2642,10 @@ def _batch_statement_file(args: argparse.Namespace, artifact_dir: Path, problem_
         if candidate.is_file():
             return candidate
 
-    record = load_bwor_record(args.dataset, problem_id)
+    try:
+        record = load_bwor_run_record(args.dataset, problem_id)
+    except (KeyError, ValueError) as exc:
+        raise CLIError(str(exc)) from exc
     statement = record.get("en_question") or record.get("cn_question")
     if not isinstance(statement, str) or not statement.strip():
         raise CLIError(f"no statement text found for {problem_id} in {args.dataset}")
@@ -3159,6 +3170,26 @@ def _batch_ids_from_summary(artifact_dir: Path) -> list[str]:
     if not ids:
         raise CLIError(f"batch summary contains no problem ids: {summary_path}")
     return ids
+
+
+def _batch_ids_for_aggregate(artifact_dir: Path, *, fallback_ids: list[str]) -> list[str]:
+    summary_ids: list[str] = []
+    try:
+        summary_ids = _batch_ids_from_summary(artifact_dir)
+    except CLIError:
+        summary_ids = []
+
+    statement_dir = artifact_dir / "statements"
+    statement_ids = [path.stem for path in sorted(statement_dir.glob("*.txt"))] if statement_dir.is_dir() else []
+    if statement_ids:
+        if summary_ids and set(summary_ids) == set(statement_ids):
+            return summary_ids
+        return statement_ids
+    if summary_ids:
+        return summary_ids
+
+    case_ids = [path.name for path in sorted(artifact_dir.iterdir()) if (path / "summary.json").is_file()]
+    return case_ids or fallback_ids
 
 
 def _needs_human_ids_from_batch_summary(artifact_dir: Path) -> list[str]:

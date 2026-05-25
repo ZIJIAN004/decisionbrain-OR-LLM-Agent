@@ -26,7 +26,7 @@ uv run or-llm-agent verify --problem <problem.json> --submission <submission.py>
 uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
-uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>] [--agent-concurrency <N>]
+uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor_run.jsonl>] [--agent-concurrency <N>]
 uv run or-llm-agent prepare-clarification --artifact-dir <case-dir> --out <questions.json>
 uv run or-llm-agent answer-clarification --artifact-dir <case-dir> --answers <answers.json> --reviewer <name>
 uv run or-llm-agent solve-clarified --artifact-dir <case-dir> --clarification <answers.json> --resolution-dir <dir>
@@ -67,6 +67,11 @@ uv run or-ci validate-spec --problem <problem.json>
 - `generate` reads BWOR question text from `data/datasets/bwor.jsonl` and OR-CI
   metadata from `../or-ci/tests/fixtures/bwor/<BWOR-ID>/problem.json` unless
   flags override the paths.
+- `solve-batch` defaults to `data/datasets/bwor_run.jsonl`, not the full
+  analysis dataset. That run dataset must contain exactly `id`, `en_question`,
+  and `answer`; `answer` is retained for post-hoc evaluator scoring and must
+  not enter capability, ProblemSpec, model-generation, clarification, or
+  fidelity prompts.
 - `classify-statement` is the source-statement capability gate before
   ProblemSpec generation. It writes a normalized JSON report with
   `status=supported|needs_human|unsupported`, `problem_family`,
@@ -131,6 +136,9 @@ uv run or-ci validate-spec --problem <problem.json>
   `<artifact-dir>/<ID>/`, writes any dataset-sourced statement text to
   `<artifact-dir>/statements/<ID>.txt`, and writes aggregate `summary.json` and
   `report.md` at the batch root.
+- `solve-batch` must reject dataset rows with keys outside `id`,
+  `en_question`, and `answer` before launching case work. Use `--statements-dir`
+  for fully external statement files.
 - `solve-batch --mode agent` supports bounded cross-case concurrency with
   `--agent-concurrency <N>`. The default is `2`; `1` preserves serial execution.
   Concurrency is only across problem IDs, not inside a single problem's
@@ -225,6 +233,7 @@ uv run or-ci validate-spec --problem <problem.json>
 | Repaired solve verifies but fidelity review still rejects | Run deterministic impact analysis and classify as `residual_harmless_equivalent`, `residual_material`, or `residual_unresolved`. |
 | `solve-batch --agent-concurrency` is less than 1 | Return nonzero before launching case work and do not write aggregate summary/report. |
 | `solve-batch` receives duplicate problem IDs | Return nonzero before launching case work and do not write aggregate summary/report. |
+| `solve-batch --dataset` points at a full analysis dataset with extra keys | Return nonzero before launching case work; require clean `bwor_run.jsonl` or `--statements-dir`. |
 | One concurrent `solve-batch` case raises unexpectedly | Record that case as failed, continue other cases, then write aggregate summary/report. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
@@ -239,9 +248,12 @@ uv run or-ci validate-spec --problem <problem.json>
   with a valid capability status.
 - Good: `solve` reaches OR-CI verification and reports `PASS` as "passed
   generated spec", not as proof that the source statement was fully modeled.
-- Good: `solve` blocks goal-programming, symbolic-coefficient, or other
-  unsupported statements before ProblemSpec generation instead of inventing an
-  LP-shaped spec.
+- Good: `solve` supports bounded OR-CI feature families only when the statement
+  gives enough semantics: LP/MILP, QP/MIQP with quadratic objectives,
+  weighted/lexicographic goal programming, and multi-scenario verification.
+- Good: `solve` blocks symbolic-coefficient, ambiguous goal-programming, or
+  other unsupported statements before ProblemSpec generation instead of
+  inventing an LP-shaped spec.
 - Good: `solve-batch` writes one case directory per id, an aggregate
   `summary.json`, and a `report.md` that lists spec validation, model
   generation, OR-CI classification, capability status, and fidelity gate status
@@ -302,6 +314,9 @@ uv run or-ci validate-spec --problem <problem.json>
   agent result.
 - Add tests that `solve` stops before ProblemSpec generation for
   `needs_human` and `unsupported` capability statuses.
+- Add tests that `solve-batch` uses clean run datasets only and rejects dataset
+  rows that contain analysis labels such as `problem_type`, `difficulty`,
+  `domain`, or `solution_status`.
 - Add tests that clarification question and answer schemas validate and reject
   malformed artifacts.
 - Add tests that required unanswered clarification questions block

@@ -206,6 +206,7 @@ def build_agent_prompt(
 ) -> str:
     question = record.get("en_question") or record.get("cn_question") or ""
     verify_base = shlex.join([*verify_command, "verify"])
+    metadata_context = _problem_metadata_context(problem)
     return f"""You are running as a nested Codex agent for OR-LLM-Agent agent mode.
 
 Goal: generate one OR-CI submission for `{problem_id}`, verify it, inspect failures, and repair it up to {options.max_repair_attempts} times.
@@ -238,15 +239,7 @@ Natural language problem:
 OR-CI problem metadata path:
 {problem_path}
 
-OR-CI instance data passed to build_model(data):
-```json
-{json.dumps(problem["instance"], ensure_ascii=False, indent=2)}
-```
-
-Metamorphic verifier configuration:
-```json
-{json.dumps(problem.get("metamorphic", {}), ensure_ascii=False, indent=2)}
-```
+{metadata_context}
 
 Submission contract:
 ```python
@@ -281,6 +274,28 @@ Process:
 5. End with a concise final message summarizing generation status and OR-CI classification.
 
 Start now. Complete the workflow without asking for confirmation.
+"""
+
+
+def _problem_metadata_context(problem: dict[str, Any]) -> str:
+    scenarios = problem.get("scenarios")
+    if isinstance(scenarios, list) and scenarios:
+        return f"""OR-CI multi-scenario metadata:
+```json
+{json.dumps({"problem_type": problem.get("problem_type"), "scenarios": scenarios}, ensure_ascii=False, indent=2)}
+```
+
+For `MULTI_SCENARIO`, OR-CI calls `build_model(data)` once per scenario using that scenario's `instance` object as `data`.
+"""
+    return f"""OR-CI instance data passed to build_model(data):
+```json
+{json.dumps(problem.get("instance", {}), ensure_ascii=False, indent=2)}
+```
+
+Metamorphic verifier configuration:
+```json
+{json.dumps(problem.get("metamorphic", {}), ensure_ascii=False, indent=2)}
+```
 """
 
 

@@ -55,10 +55,49 @@ PROBLEM_METADATA_TEMPLATE: dict[str, Any] = {
 }
 
 
+SUPPORTED_PROBLEM_TYPES = ("LP", "MILP", "QP", "MIQP", "MULTI_SCENARIO")
+
+
 def build_problem_metadata_template(problem_id: str) -> str:
     template = json.loads(json.dumps(PROBLEM_METADATA_TEMPLATE))
     template["id"] = problem_id
     return json.dumps(template, ensure_ascii=False, indent=2)
+
+
+def _feature_family_problem_spec_rules(source_label: str) -> str:
+    problem_types = "`, `".join(SUPPORTED_PROBLEM_TYPES)
+    return f"""- Valid `problem_type` values are: `{problem_types}`.
+- For linear LP/MILP cases, use `LP` or `MILP` and keep all coefficients, bounds, capacities, demands, and requirements under `instance`.
+- For quadratic-objective QP/MIQP cases, use `QP` or `MIQP` only when the objective has quadratic terms and all constraints are still supported linear constraints. Put primitive quadratic coefficients under `instance`, and point `metamorphic.cost_scaling.coefficient_paths` at those coefficients when they are part of the objective.
+- Do not use `QP` or `MIQP` for quadratic constraints; quadratic constraints remain unsupported by OR-CI.
+- For weighted goal programming, include `metamorphic.goal_programming` with `mode: "weighted"`, `objective_sense`, and `goals[]`; each goal needs `name`, a linear `expression`, and a positive `weight`.
+- For lexicographic goal programming, include `metamorphic.goal_programming` with `mode: "lexicographic"`, `objective_sense`, and `goals[]`; each goal needs `name`, a linear `expression`, a positive integer `priority`, and a positive `priority_weight`. Priority weights must strictly decrease as priority numbers increase.
+- For multi-scenario problems, use top-level `problem_type: "MULTI_SCENARIO"` and a non-empty top-level `scenarios[]` list. Each scenario needs `name`, `instance`, and `expected_solver_status`; scenario `problem_type` may be `LP`, `MILP`, `QP`, or `MIQP`. Add scenario-level `objective` and `metamorphic` checks only when the {source_label} gives enough explicit data.
+- If the {source_label} asks for more than one related outcome, such as proving a base case infeasible and then solving a modified or repaired case, do not collapse those outcomes into one blended model. Represent each required outcome as a separate scenario with its own `instance` and `expected_solver_status`.
+- Do not include dataset labels such as benchmark `problem_type`, `difficulty`, `domain`, `solution_status`, or `answer`; use only facts stated in the {source_label}.
+"""
+
+
+def _problem_metadata_context(problem: dict[str, Any]) -> str:
+    scenarios = problem.get("scenarios")
+    if isinstance(scenarios, list) and scenarios:
+        return f"""OR-CI multi-scenario metadata:
+```json
+{json.dumps({"problem_type": problem.get("problem_type"), "scenarios": scenarios}, ensure_ascii=False, indent=2)}
+```
+
+For `MULTI_SCENARIO`, OR-CI calls `build_model(data)` once per scenario using that scenario's `instance` object as `data`.
+"""
+    return f"""OR-CI instance data passed to build_model(data):
+```json
+{json.dumps(problem.get("instance", {}), ensure_ascii=False, indent=2)}
+```
+
+Metamorphic verifier configuration:
+```json
+{json.dumps(problem.get("metamorphic", {}), ensure_ascii=False, indent=2)}
+```
+"""
 
 
 def build_problem_spec_prompt(problem_id: str, statement: str) -> str:
@@ -76,9 +115,10 @@ Generate exactly one JSON object matching this OR-CI problem metadata template:
 Rules:
 - Output only one JSON object. Do not include markdown, commentary, or Python.
 - Use the provided problem id as the `id`.
-- Put all model data needed by solver code under `instance`.
+- For non-scenario problems, put all model data needed by solver code under `instance`.
 - Preserve primitive statement quantities under `instance`. If the statement gives separate profit and transport cost, keep both fields; do not replace them only with a derived net-benefit field.
 - Derived fields may be included only when the primitive fields used to derive them are also present.
+{_feature_family_problem_spec_rules("statement")}
 - Include `metamorphic.cost_scaling` with at least one numeric objective coefficient path.
 - Point `cost_scaling.coefficient_paths` at primitive objective coefficients where practical. For profit-minus-cost objectives, include both profit and cost coefficient paths.
 - Add `metamorphic.constraint_relaxation` only when the statement has a clear resource, demand, supply, or capacity value whose relaxation direction is defensible.
@@ -169,9 +209,10 @@ Rules:
 - Treat the original statement plus approved clarification answers as the source. Do not use unapproved assumptions.
 - Include only facts supported by the original statement or the clarification answers.
 - Add a top-level `source_context` object with `clarified: true`, `clarification_status`, and `clarified_from`.
-- Put all model data needed by solver code under `instance`.
+- For non-scenario problems, put all model data needed by solver code under `instance`.
 - Preserve primitive statement quantities under `instance`. If the statement gives separate profit and transport cost, keep both fields; do not replace them only with a derived net-benefit field.
 - Derived fields may be included only when the primitive fields used to derive them are also present.
+{_feature_family_problem_spec_rules("statement or approved clarification answers")}
 - Include `metamorphic.cost_scaling` with at least one numeric objective coefficient path.
 - Point `cost_scaling.coefficient_paths` at primitive objective coefficients where practical. For profit-minus-cost objectives, include both profit and cost coefficient paths.
 - Add `metamorphic.constraint_relaxation` only when the clarified source has a clear resource, demand, supply, or capacity value whose relaxation direction is defensible.
@@ -192,8 +233,10 @@ Natural language problem statement:
 Classify whether the current OR-CI workflow can safely automate this statement.
 
 Current supported target:
-- deterministic, numeric, single-objective linear optimization models;
-- LP/MILP-style variables and linear constraints that Gurobi can expose through the current linear ModelIR;
+- deterministic, numeric LP/MILP-style optimization models with linear constraints;
+- QP/MIQP models with quadratic objective terms and no quadratic constraints;
+- weighted or lexicographic goal-programming scalarizations when targets, weights or priorities, achievement direction, and deviation variables are explicit;
+- multi-scenario verification when each named scenario has explicit data and expected solver status or objective checks;
 - all objective coefficients, bounds, capacities, demands, and requirements are explicit numeric data;
 - objective direction and all constraint families can be represented without inventing semantics.
 
@@ -201,9 +244,10 @@ Current unsupported or needs-human triggers:
 - symbolic coefficients without numeric values, such as c_j;
 - source contradictions, missing required data, or unit ambiguity;
 - strict inequalities whose intended modeling treatment is not explicit;
-- multi-objective, goal-programming, lexicographic objective, preemptive-priority, or achievement-function semantics;
-- nonlinear, quadratic, conic, stochastic, robust, dynamic, or simulation-based formulations;
-- solver features OR-CI currently rejects, including multiple objectives, quadratic terms or constraints, SOS, general constraints, and piecewise-linear objectives.
+- vague multi-objective, goal-programming, lexicographic, preemptive-priority, or achievement-function semantics without explicit scalarization data;
+- quadratic constraints; nonlinear constraints; conic, stochastic, robust, dynamic, or simulation-based formulations;
+- solver features OR-CI currently rejects, including native multiple objectives, SOS, general constraints, and piecewise-linear objectives.
+- A statement that asks for multiple related outcomes, such as a base infeasible case plus a modified feasible case, should be classified as supported multi-scenario only when the data for each scenario are explicit.
 
 Return exactly one JSON object with this shape:
 
@@ -222,7 +266,7 @@ Return exactly one JSON object with this shape:
 
 Decision rules:
 - The `status` value must be exactly one of `supported`, `needs_human`, or `unsupported`.
-- Use `supported` only when the statement can be faithfully represented by the current OR-CI ProblemSpec and verified as a generated-spec LP/MILP workflow.
+- Use `supported` only when the statement can be faithfully represented by the current OR-CI ProblemSpec and verified as a generated-spec LP/MILP, QP/MIQP quadratic-objective, goal-programming, or multi-scenario workflow.
 - Use `needs_human` when the problem might be representable after clarification but the statement has missing, symbolic, contradictory, or ambiguous information.
 - Use `unsupported` when the problem requires semantics outside the current ProblemSpec/verifier support.
 - Do not solve the problem. Do not generate a ProblemSpec. Only classify capability.
@@ -237,15 +281,7 @@ def build_or_ci_prompt(problem_id: str, record: dict[str, Any], problem: dict[st
 Natural language problem:
 {question}
 
-OR-CI instance data passed to build_model(data):
-```json
-{json.dumps(problem["instance"], ensure_ascii=False, indent=2)}
-```
-
-Metamorphic verifier configuration:
-```json
-{json.dumps(problem.get("metamorphic", {}), ensure_ascii=False, indent=2)}
-```
+{_problem_metadata_context(problem)}
 
 Write one Python module with exactly this public contract:
 
