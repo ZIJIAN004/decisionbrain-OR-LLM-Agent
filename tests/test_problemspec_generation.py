@@ -1061,6 +1061,79 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["summary"]["clarified_supported_case_count"], 1)
 
+    def test_solve_clarified_batch_runs_cases_concurrently_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            clarifications_dir = root / "answers"
+            clarifications_dir.mkdir()
+            problem_ids = ["CASE-001", "CASE-002"]
+            for problem_id in problem_ids:
+                _write_needs_human_case(root, batch_dir / problem_id, problem_id=problem_id)
+                (clarifications_dir / f"{problem_id}.json").write_text(
+                    json.dumps(_clarification_answers(problem_id=problem_id)),
+                    encoding="utf-8",
+                )
+            rows = [
+                {
+                    "problem_id": problem_id,
+                    "capability_status": "needs_human",
+                    "classification": "blocked_capability",
+                }
+                for problem_id in problem_ids
+            ]
+            (batch_dir / "summary.json").write_text(json.dumps({"summary": {"total": 2}, "rows": rows}), encoding="utf-8")
+            barrier = threading.Barrier(2, timeout=5)
+            active_workers = 0
+            max_active_workers = 0
+            lock = threading.Lock()
+
+            def fake_solve(*, artifact_dir, clarification_path, resolution_dir, args):
+                nonlocal active_workers, max_active_workers
+                with lock:
+                    active_workers += 1
+                    max_active_workers = max(max_active_workers, active_workers)
+                try:
+                    barrier.wait()
+                    return {
+                        "problem_id": artifact_dir.name,
+                        "source_artifact": str(artifact_dir),
+                        "resolution_artifact": str(resolution_dir),
+                        "clarified_from": str(artifact_dir),
+                        "clarification_status": "answered",
+                        "clarification_question_count": 1,
+                        "clarification_answer_count": 1,
+                        "clarification_source": "manual_review",
+                        "clarification_gate_status": "passed",
+                        "classification": "SUCCESS",
+                        "verification_status": "PASS",
+                        "spec_fidelity_status": "not_reviewed",
+                    }
+                finally:
+                    with lock:
+                        active_workers -= 1
+
+            with patch("or_llm_agent.cli.solve_clarified_artifact", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-clarified-batch",
+                        "--artifact-dir",
+                        str(batch_dir),
+                        "--clarifications-dir",
+                        str(clarifications_dir),
+                        "--ids",
+                        *problem_ids,
+                        "--agent-concurrency",
+                        "2",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(max_active_workers, 2)
+            summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["problem_id"] for row in summary["rows"]], problem_ids)
+            self.assertEqual(summary["summary"]["clarified_supported_case_count"], 2)
+
     def test_solve_clarified_batch_records_unresolved_row_when_answer_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

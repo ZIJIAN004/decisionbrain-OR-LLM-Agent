@@ -101,6 +101,20 @@ class SolveBatchCaseResult:
 
 
 @dataclass(frozen=True)
+class SolveClarifiedBatchCase:
+    problem_id: str
+    case_dir: Path
+    clarification_path: Path
+    resolution_dir: Path
+
+
+@dataclass(frozen=True)
+class SolveClarifiedBatchCaseResult:
+    problem_id: str
+    row: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ClarificationAgentResult:
     raw_text: str
     returncode: int
@@ -332,6 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     solve_clarified_batch.add_argument("--mode", choices=("agent",), default="agent")
     solve_clarified_batch.add_argument("--model", default="o3-mini")
     solve_clarified_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    solve_clarified_batch.add_argument(
+        "--agent-concurrency",
+        default=2,
+        type=int,
+        help="agent mode: maximum number of clarified solve cases to run concurrently; 1 preserves serial execution",
+    )
     _add_agent_options(solve_clarified_batch)
 
     review = subparsers.add_parser("review-fidelity", help="record a source-statement fidelity review")
@@ -911,39 +931,91 @@ def prepare_clarification_batch_command(args: argparse.Namespace) -> int:
 def solve_clarified_batch_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     ids = args.ids or _needs_human_ids_from_batch_summary(artifact_dir)
-    rows: list[dict[str, Any]] = []
-    for problem_id in ids:
-        case_dir = artifact_dir / problem_id
-        clarification_path = _clarification_answers_path(args.clarifications_dir.resolve(), problem_id)
-        resolution_dir = _next_attempt_dir(artifact_dir / "clarified" / problem_id)
-        try:
-            result = solve_clarified_artifact(
-                artifact_dir=case_dir,
-                clarification_path=clarification_path,
-                resolution_dir=resolution_dir,
-                args=args,
-            )
-            rows.append(_clarification_row_from_solve(result, artifact_dir))
-        except CLIError as exc:
-            rows.append(
-                {
-                    "problem_id": problem_id,
-                    "source_artifact": _relative(case_dir, artifact_dir),
-                    "clarification_status": "unresolved",
-                    "clarification_gate_status": "blocked",
-                    "error": redact_text(str(exc)),
-                    "resolution_artifact": _relative(resolution_dir, artifact_dir),
-                    "classification": "blocked_clarification",
-                    "verification_status": "skipped",
-                    "spec_fidelity_status": "not_reviewed",
-                }
-            )
+    concurrency = _validate_agent_concurrency(args.agent_concurrency)
+    _validate_unique_problem_ids(ids)
+    cases = [
+        SolveClarifiedBatchCase(
+            problem_id=problem_id,
+            case_dir=artifact_dir / problem_id,
+            clarification_path=_clarification_answers_path(args.clarifications_dir.resolve(), problem_id),
+            resolution_dir=_next_attempt_dir(artifact_dir / "clarified" / problem_id),
+        )
+        for problem_id in ids
+    ]
+    results = _run_solve_clarified_batch_cases(args, cases, artifact_dir=artifact_dir, concurrency=concurrency)
+    result_by_id = {result.problem_id: result for result in results}
+    rows = [result_by_id[case.problem_id].row for case in cases]
 
     summary = summarize_clarification_rows(rows)
     _write_summary(artifact_dir / "clarification-summary.json", {"summary": summary, "rows": rows})
     write_clarification_report(artifact_dir / "clarification-report.md", summary, rows)
     print(f"solved clarified {len(rows)} case(s); wrote {artifact_dir / 'clarification-report.md'}")
     return 0 if all(row.get("clarification_gate_status") == "passed" and row.get("verification_status") == "PASS" for row in rows) else 1
+
+
+def _run_solve_clarified_batch_cases(
+    args: argparse.Namespace,
+    cases: list[SolveClarifiedBatchCase],
+    *,
+    artifact_dir: Path,
+    concurrency: int,
+) -> list[SolveClarifiedBatchCaseResult]:
+    if concurrency == 1 or len(cases) <= 1:
+        return [_run_solve_clarified_batch_case(args, case, artifact_dir=artifact_dir) for case in cases]
+
+    results: list[SolveClarifiedBatchCaseResult] = []
+    max_workers = min(concurrency, len(cases))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_run_solve_clarified_batch_case, args, case, artifact_dir=artifact_dir)
+            for case in cases
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+
+def _run_solve_clarified_batch_case(
+    args: argparse.Namespace,
+    case: SolveClarifiedBatchCase,
+    *,
+    artifact_dir: Path,
+) -> SolveClarifiedBatchCaseResult:
+    case_args = argparse.Namespace(**vars(args))
+    try:
+        result = solve_clarified_artifact(
+            artifact_dir=case.case_dir,
+            clarification_path=case.clarification_path,
+            resolution_dir=case.resolution_dir,
+            args=case_args,
+        )
+        row = _clarification_row_from_solve(result, artifact_dir)
+    except CLIError as exc:
+        row = _blocked_clarified_batch_row(case, artifact_dir=artifact_dir, error=redact_text(str(exc)))
+    except Exception as exc:
+        error = redact_text(f"{type(exc).__name__}: {exc}")
+        print(f"{case.problem_id}: clarified solve failed with unexpected error: {error}", file=sys.stderr)
+        row = _blocked_clarified_batch_row(case, artifact_dir=artifact_dir, error=error)
+    return SolveClarifiedBatchCaseResult(problem_id=case.problem_id, row=row)
+
+
+def _blocked_clarified_batch_row(
+    case: SolveClarifiedBatchCase,
+    *,
+    artifact_dir: Path,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "problem_id": case.problem_id,
+        "source_artifact": _relative(case.case_dir, artifact_dir),
+        "clarification_status": "unresolved",
+        "clarification_gate_status": "blocked",
+        "error": error,
+        "resolution_artifact": _relative(case.resolution_dir, artifact_dir),
+        "classification": "blocked_clarification",
+        "verification_status": "skipped",
+        "spec_fidelity_status": "not_reviewed",
+    }
 
 
 def review_fidelity_command(args: argparse.Namespace) -> int:
