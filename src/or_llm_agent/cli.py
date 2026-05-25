@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +77,22 @@ class CapabilityAgentResult:
     events_path: Path
     last_message_path: Path
     stderr: str
+
+
+@dataclass(frozen=True)
+class SolveBatchCase:
+    problem_id: str
+    statement_path: Path
+    case_dir: Path
+
+
+@dataclass(frozen=True)
+class SolveBatchCaseResult:
+    problem_id: str
+    exit_code: int
+    statement_path: Path
+    case_dir: Path
+    error: str = ""
 
 
 FIDELITY_ACCEPTED_STATUSES = {"accepted", "llm_accepted"}
@@ -200,6 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
     solve_batch.add_argument("--dataset", default=default_bwor_dataset(), type=Path)
     solve_batch.add_argument("--model", default="o3-mini")
     solve_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    solve_batch.add_argument(
+        "--agent-concurrency",
+        default=2,
+        type=int,
+        help="agent mode: maximum number of solve cases to run concurrently; 1 preserves serial execution",
+    )
     _add_agent_options(solve_batch)
 
     review = subparsers.add_parser("review-fidelity", help="record a source-statement fidelity review")
@@ -612,23 +635,24 @@ def solve_batch_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    concurrency = _validate_agent_concurrency(args.agent_concurrency)
+    _validate_unique_problem_ids(args.ids)
+    cases = _prepare_solve_batch_cases(args, artifact_dir)
+    results = _run_solve_batch_cases(args, cases, concurrency=concurrency)
+    result_by_id = {result.problem_id: result for result in results}
+
     rows: list[dict[str, Any]] = []
-    for problem_id in args.ids:
-        statement_path = _batch_statement_file(args, artifact_dir, problem_id)
-        case_dir = artifact_dir / problem_id
-        solve_args = argparse.Namespace(**vars(args))
-        solve_args.command = "solve"
-        solve_args.problem_id = problem_id
-        solve_args.statement_file = statement_path
-        solve_args.artifact_dir = case_dir
-        exit_code = solve_command(solve_args)
+    for case in cases:
+        result = result_by_id[case.problem_id]
         row = _solve_batch_row(
-            problem_id=problem_id,
-            exit_code=exit_code,
+            problem_id=case.problem_id,
+            exit_code=result.exit_code,
             artifact_dir=artifact_dir,
-            case_dir=case_dir,
-            statement_path=statement_path,
+            case_dir=case.case_dir,
+            statement_path=case.statement_path,
         )
+        if result.error:
+            row["batch_error"] = result.error
         rows.append(row)
 
     summary = summarize_solve_batch(rows)
@@ -637,6 +661,82 @@ def solve_batch_command(args: argparse.Namespace) -> int:
     write_solve_batch_report(artifact_dir / "report.md", args, summary, rows)
     print(f"wrote {artifact_dir / 'report.md'}")
     return 0 if all(row["exit_code"] == 0 for row in rows) else 1
+
+
+def _validate_agent_concurrency(value: int) -> int:
+    if value < 1:
+        raise CLIError("--agent-concurrency must be >= 1")
+    return value
+
+
+def _validate_unique_problem_ids(problem_ids: list[str]) -> None:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for problem_id in problem_ids:
+        if problem_id in seen and problem_id not in duplicates:
+            duplicates.append(problem_id)
+        seen.add(problem_id)
+    if duplicates:
+        joined = ", ".join(duplicates)
+        raise CLIError(f"solve-batch problem ids must be unique; duplicate id(s): {joined}")
+
+
+def _prepare_solve_batch_cases(args: argparse.Namespace, artifact_dir: Path) -> list[SolveBatchCase]:
+    cases: list[SolveBatchCase] = []
+    for problem_id in args.ids:
+        statement_path = _batch_statement_file(args, artifact_dir, problem_id)
+        cases.append(
+            SolveBatchCase(
+                problem_id=problem_id,
+                statement_path=statement_path,
+                case_dir=artifact_dir / problem_id,
+            )
+        )
+    return cases
+
+
+def _run_solve_batch_cases(
+    args: argparse.Namespace,
+    cases: list[SolveBatchCase],
+    *,
+    concurrency: int,
+) -> list[SolveBatchCaseResult]:
+    if concurrency == 1 or len(cases) <= 1:
+        return [_run_solve_batch_case(args, case) for case in cases]
+
+    results: list[SolveBatchCaseResult] = []
+    max_workers = min(concurrency, len(cases))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_solve_batch_case, args, case) for case in cases]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+
+def _run_solve_batch_case(args: argparse.Namespace, case: SolveBatchCase) -> SolveBatchCaseResult:
+    solve_args = argparse.Namespace(**vars(args))
+    solve_args.command = "solve"
+    solve_args.problem_id = case.problem_id
+    solve_args.statement_file = case.statement_path
+    solve_args.artifact_dir = case.case_dir
+    try:
+        exit_code = solve_command(solve_args)
+        return SolveBatchCaseResult(
+            problem_id=case.problem_id,
+            exit_code=exit_code,
+            statement_path=case.statement_path,
+            case_dir=case.case_dir,
+        )
+    except Exception as exc:
+        error = redact_text(f"{type(exc).__name__}: {exc}")
+        print(f"{case.problem_id}: solve failed with unexpected error: {error}", file=sys.stderr)
+        return SolveBatchCaseResult(
+            problem_id=case.problem_id,
+            exit_code=1,
+            statement_path=case.statement_path,
+            case_dir=case.case_dir,
+            error=error,
+        )
 
 
 def review_fidelity_command(args: argparse.Namespace) -> int:

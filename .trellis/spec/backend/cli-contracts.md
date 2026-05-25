@@ -26,7 +26,7 @@ uv run or-llm-agent verify --problem <problem.json> --submission <submission.py>
 uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
-uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>]
+uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>] [--agent-concurrency <N>]
 uv run or-llm-agent review-fidelity --mode manual --artifact-dir <solve-dir> --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
 uv run or-llm-agent review-fidelity --mode agent --artifact-dir <solve-dir>
 uv run or-llm-agent review-fidelity-batch --mode manual --artifact-dir <batch-dir> [--ids <ID>...] --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
@@ -126,6 +126,16 @@ uv run or-ci validate-spec --problem <problem.json>
   `<artifact-dir>/<ID>/`, writes any dataset-sourced statement text to
   `<artifact-dir>/statements/<ID>.txt`, and writes aggregate `summary.json` and
   `report.md` at the batch root.
+- `solve-batch --mode agent` supports bounded cross-case concurrency with
+  `--agent-concurrency <N>`. The default is `2`; `1` preserves serial execution.
+  Concurrency is only across problem IDs, not inside a single problem's
+  capability/spec/generation/verification pipeline.
+- `solve-batch` must reject `--agent-concurrency < 1` and duplicate problem IDs
+  before launching any per-case solve work, because duplicate IDs share the same
+  case artifact directory.
+- Concurrent `solve-batch` must write aggregate `summary.json` and `report.md`
+  from the parent after all workers complete, preserving input ID order even
+  when workers finish out of order.
 - Generated specs are run artifacts until reviewed. Do not treat a generated
   `problem.json` as benchmark ground truth.
 - Generated submissions must be extracted from fenced Python code blocks and
@@ -169,6 +179,9 @@ uv run or-ci validate-spec --problem <problem.json>
 | `resolve-fidelity` source artifact is not rejected | Skip unless `--force` is set; record `skipped_not_rejected` if explicitly invoked. |
 | Repaired ProblemSpec does not validate or repaired solve fails | Record `repair_failed`; do not overwrite the source solve artifact. |
 | Repaired solve verifies but fidelity review still rejects | Run deterministic impact analysis and classify as `residual_harmless_equivalent`, `residual_material`, or `residual_unresolved`. |
+| `solve-batch --agent-concurrency` is less than 1 | Return nonzero before launching case work and do not write aggregate summary/report. |
+| `solve-batch` receives duplicate problem IDs | Return nonzero before launching case work and do not write aggregate summary/report. |
+| One concurrent `solve-batch` case raises unexpectedly | Record that case as failed, continue other cases, then write aggregate summary/report. |
 | OR-CI report exists | Preserve report JSON; summarize classification/status separately. |
 | OR-CI command fails before report | Record `VERIFY_COMMAND_FAILED` in CLI summary data. |
 
@@ -238,6 +251,11 @@ uv run or-ci validate-spec --problem <problem.json>
   fails.
 - Add tests that `solve-batch` writes an aggregate summary/report from mocked
   per-case solves.
+- Add tests that `solve-batch --agent-concurrency 1` preserves serial behavior,
+  `--agent-concurrency 2` runs two independent cases concurrently, duplicate
+  IDs and invalid concurrency are rejected before case work starts, aggregate
+  rows preserve input order, a larger multi-wave batch can run with bounded
+  concurrency, and per-case exceptions do not abort the whole batch.
 - Add tests that `review-fidelity` updates single-case summary/report artifacts
   and that `review-fidelity-batch` rewrites aggregate batch status.
 - Add tests that `review-fidelity --mode agent` records `llm_accepted` for a
@@ -295,3 +313,25 @@ summary["verification_note"] = "passed generated spec"
 ```
 
 Keep source-statement fidelity separate from generated-spec verification.
+
+#### Wrong
+
+```python
+for problem_id in args.ids:
+    submit_case_to_thread(problem_id)
+```
+
+This launches work before validating duplicate IDs and can race two workers into
+the same `<artifact-dir>/<problem-id>/` directory.
+
+#### Correct
+
+```python
+_validate_unique_problem_ids(args.ids)
+cases = _prepare_solve_batch_cases(args, artifact_dir)
+run_cases_with_bounded_concurrency(cases, max_workers=args.agent_concurrency)
+```
+
+Validate the full batch before launching case work, keep each case in its own
+artifact directory, and write aggregate summaries from the parent after all
+workers finish.

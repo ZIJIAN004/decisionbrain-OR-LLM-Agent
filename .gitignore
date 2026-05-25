@@ -183,6 +183,11 @@ model.ilp
 
 *.ilp
 
+# Generated local run artifacts. Keep the curated BWOR artifact bundle tracked.
+artifacts/*
+!artifacts/BWOR/
+!artifacts/BWOR/**
+
 # Local agent/runtime artifacts
 .agents/
 .claude/

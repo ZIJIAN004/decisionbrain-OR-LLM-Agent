@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -487,6 +489,270 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(len(batch["rows"]), 2)
             self.assertTrue((artifact_dir / "report.md").exists())
             self.assertTrue((artifact_dir / "CASE-001" / "spec" / "fidelity-review.json").exists())
+
+    def test_solve_batch_preserves_serial_behavior_with_concurrency_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statements_dir = root / "statements"
+            statements_dir.mkdir()
+            for problem_id in ("CASE-001", "CASE-002"):
+                (statements_dir / f"{problem_id}.txt").write_text(f"Statement for {problem_id}.", encoding="utf-8")
+            artifact_dir = root / "batch"
+            calls: list[str] = []
+
+            def fake_solve(solve_args):
+                calls.append(solve_args.problem_id)
+                _write_minimal_case_summary(solve_args.artifact_dir, solve_args.problem_id)
+                return 0
+
+            with patch("or_llm_agent.cli.solve_command", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-001",
+                        "CASE-002",
+                        "--statements-dir",
+                        str(statements_dir),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(calls, ["CASE-001", "CASE-002"])
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["problem_id"] for row in batch["rows"]], ["CASE-001", "CASE-002"])
+
+    def test_solve_batch_runs_cases_concurrently_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statements_dir = root / "statements"
+            statements_dir.mkdir()
+            for problem_id in ("CASE-001", "CASE-002"):
+                (statements_dir / f"{problem_id}.txt").write_text(f"Statement for {problem_id}.", encoding="utf-8")
+            artifact_dir = root / "batch"
+            barrier = threading.Barrier(2, timeout=5)
+            seen: set[str] = set()
+            lock = threading.Lock()
+
+            def fake_run(**kwargs):
+                with lock:
+                    seen.add(kwargs["problem_id"])
+                barrier.wait()
+                return _agent_result(root, _valid_problem(kwargs["problem_id"]))
+
+            verification = VerificationResult(
+                returncode=0,
+                stdout="",
+                stderr="",
+                report={"classification": "SUCCESS", "status": "PASS", "checks": []},
+            )
+
+            with (
+                patch("or_llm_agent.cli._run_capability_agent", return_value=_capability_agent_result(root, _supported_capability())),
+                patch("or_llm_agent.cli._run_problem_spec_agent", fake_run),
+                patch("or_llm_agent.cli.generate_agent_submission", _fake_generate_agent_submission),
+                patch("or_llm_agent.cli.run_or_ci_verify", return_value=verification),
+            ):
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-001",
+                        "CASE-002",
+                        "--statements-dir",
+                        str(statements_dir),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "2",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(seen, {"CASE-001", "CASE-002"})
+
+    def test_solve_batch_handles_larger_concurrent_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statements_dir = root / "statements"
+            statements_dir.mkdir()
+            problem_ids = [f"CASE-{index:03d}" for index in range(1, 13)]
+            for problem_id in problem_ids:
+                (statements_dir / f"{problem_id}.txt").write_text(f"Statement for {problem_id}.", encoding="utf-8")
+            artifact_dir = root / "batch"
+            barrier = threading.Barrier(4, timeout=5)
+            active_workers = 0
+            max_active_workers = 0
+            lock = threading.Lock()
+
+            def fake_solve(solve_args):
+                nonlocal active_workers, max_active_workers
+                with lock:
+                    active_workers += 1
+                    max_active_workers = max(max_active_workers, active_workers)
+                try:
+                    barrier.wait()
+                    _write_minimal_case_summary(solve_args.artifact_dir, solve_args.problem_id)
+                    return 0
+                finally:
+                    with lock:
+                        active_workers -= 1
+
+            with patch("or_llm_agent.cli.solve_command", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        *problem_ids,
+                        "--statements-dir",
+                        str(statements_dir),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "4",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(max_active_workers, 4)
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch["summary"]["total"], 12)
+            self.assertEqual(batch["summary"]["succeeded"], 12)
+            self.assertEqual([row["problem_id"] for row in batch["rows"]], problem_ids)
+
+    def test_solve_batch_rejects_invalid_agent_concurrency_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+
+            with patch("or_llm_agent.cli.solve_command") as solve_command:
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-001",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "0",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            solve_command.assert_not_called()
+            self.assertFalse((artifact_dir / "summary.json").exists())
+
+    def test_solve_batch_rejects_duplicate_ids_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact_dir = root / "batch"
+
+            with patch("or_llm_agent.cli.solve_command") as solve_command:
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-001",
+                        "CASE-001",
+                        "--artifact-dir",
+                        str(artifact_dir),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            solve_command.assert_not_called()
+            self.assertFalse((artifact_dir / "summary.json").exists())
+
+    def test_solve_batch_preserves_input_order_when_workers_finish_out_of_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statements_dir = root / "statements"
+            statements_dir.mkdir()
+            for problem_id in ("CASE-SLOW", "CASE-FAST"):
+                (statements_dir / f"{problem_id}.txt").write_text(f"Statement for {problem_id}.", encoding="utf-8")
+            artifact_dir = root / "batch"
+
+            def fake_solve(solve_args):
+                if solve_args.problem_id == "CASE-SLOW":
+                    time.sleep(0.2)
+                _write_minimal_case_summary(solve_args.artifact_dir, solve_args.problem_id)
+                return 0
+
+            with patch("or_llm_agent.cli.solve_command", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-SLOW",
+                        "CASE-FAST",
+                        "--statements-dir",
+                        str(statements_dir),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "2",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["problem_id"] for row in batch["rows"]], ["CASE-SLOW", "CASE-FAST"])
+
+    def test_solve_batch_records_case_exception_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statements_dir = root / "statements"
+            statements_dir.mkdir()
+            for problem_id in ("CASE-FAIL", "CASE-OK"):
+                (statements_dir / f"{problem_id}.txt").write_text(f"Statement for {problem_id}.", encoding="utf-8")
+            artifact_dir = root / "batch"
+
+            def fake_solve(solve_args):
+                if solve_args.problem_id == "CASE-FAIL":
+                    raise RuntimeError("synthetic failure")
+                _write_minimal_case_summary(solve_args.artifact_dir, solve_args.problem_id)
+                return 0
+
+            with patch("or_llm_agent.cli.solve_command", fake_solve):
+                exit_code = main(
+                    [
+                        "solve-batch",
+                        "--mode",
+                        "agent",
+                        "--ids",
+                        "CASE-FAIL",
+                        "CASE-OK",
+                        "--statements-dir",
+                        str(statements_dir),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--agent-concurrency",
+                        "2",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            batch = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            row_by_id = {row["problem_id"]: row for row in batch["rows"]}
+            self.assertEqual(row_by_id["CASE-FAIL"]["exit_code"], 1)
+            self.assertIn("RuntimeError", row_by_id["CASE-FAIL"]["batch_error"])
+            self.assertEqual(row_by_id["CASE-OK"]["exit_code"], 0)
 
     def test_review_fidelity_accepts_case(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1028,6 +1294,31 @@ def _write_solved_case(
     expected = 0 if verification.returncode == 0 else 1
     if exit_code != expected:
         raise AssertionError(f"unexpected solve exit code: {exit_code}")
+
+
+def _write_minimal_case_summary(artifact_dir: Path, problem_id: str) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "problem_id": problem_id,
+                "capability_status": "supported",
+                "capability_generation_status": "classified",
+                "problem_family": "linear programming",
+                "spec_validation_status": "passed",
+                "spec_attempt_count": 1,
+                "spec_repair_status": "not_needed",
+                "model_generation_status": "generated",
+                "verification_status": "PASS",
+                "classification": "SUCCESS",
+                "spec_fidelity_status": "not_reviewed",
+                "spec_fidelity_gate_status": "manual_review_required",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _valid_problem(problem_id: str = "CASE-001") -> dict:
