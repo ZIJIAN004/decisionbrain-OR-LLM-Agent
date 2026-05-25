@@ -220,6 +220,7 @@ uv run or-ci validate-spec --problem <problem.json>
 | Required clarification question is unanswered | `answer-clarification` writes/keeps `partially_answered`; `solve-clarified` refuses to run ProblemSpec generation. |
 | Clarification artifact is `rejected` or `unresolved` | `solve-clarified` refuses to run ProblemSpec generation. |
 | Clarified solve is run | Write all new artifacts under the requested resolution directory; preserve the original blocked solve summary and classifier output. |
+| One `prepare-clarification-batch` case raises `CLIError` or unexpected exception | Record that case with `clarification_status=prepare_failed` and `clarification_gate_status=blocked`, continue other cases, write the aggregate `clarification-summary.json` and `clarification-report.md`, and return nonzero. |
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
 | Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |

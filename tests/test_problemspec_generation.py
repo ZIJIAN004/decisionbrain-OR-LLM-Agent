@@ -1075,6 +1075,47 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["summary"]["attempted_needs_human_count"], 1)
 
+    def test_prepare_clarification_batch_records_failures_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            batch_dir = root / "batch"
+            _write_needs_human_case(root, batch_dir / "CASE-OK", problem_id="CASE-OK")
+            _write_needs_human_case(root, batch_dir / "CASE-BAD", problem_id="CASE-BAD")
+            rows = [
+                {"problem_id": "CASE-OK", "capability_status": "needs_human", "classification": "blocked_capability"},
+                {"problem_id": "CASE-BAD", "capability_status": "needs_human", "classification": "blocked_capability"},
+            ]
+            (batch_dir / "summary.json").write_text(json.dumps({"summary": {"total": 2}, "rows": rows}), encoding="utf-8")
+            calls = []
+
+            def fake_prepare(*, artifact_dir, out_path, args):
+                calls.append(artifact_dir.name)
+                if artifact_dir.name == "CASE-BAD":
+                    raise CLIError("planner failed for CASE-BAD")
+                payload = _clarification_questions(problem_id=artifact_dir.name)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(payload), encoding="utf-8")
+                return payload
+
+            with patch("or_llm_agent.cli.prepare_clarification_artifact", fake_prepare):
+                exit_code = main(["prepare-clarification-batch", "--artifact-dir", str(batch_dir)])
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(calls, ["CASE-OK", "CASE-BAD"])
+            self.assertTrue((batch_dir / "clarification-summary.json").exists())
+            self.assertTrue((batch_dir / "clarification-report.md").exists())
+            summary = json.loads((batch_dir / "clarification-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["summary"]["attempted_needs_human_count"], 2)
+            statuses = summary["summary"]["clarification_statuses"]
+            self.assertEqual(statuses.get("questions_prepared"), 1)
+            self.assertEqual(statuses.get("prepare_failed"), 1)
+            self.assertGreaterEqual(summary["summary"]["unresolved_case_count"], 1)
+            rows_by_id = {row["problem_id"]: row for row in summary["rows"]}
+            self.assertEqual(rows_by_id["CASE-OK"]["clarification_status"], "questions_prepared")
+            self.assertEqual(rows_by_id["CASE-BAD"]["clarification_status"], "prepare_failed")
+            self.assertEqual(rows_by_id["CASE-BAD"]["clarification_gate_status"], "blocked")
+            self.assertIn("planner failed for CASE-BAD", rows_by_id["CASE-BAD"]["error"])
+
     def test_solve_clarified_batch_defaults_to_needs_human_cases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

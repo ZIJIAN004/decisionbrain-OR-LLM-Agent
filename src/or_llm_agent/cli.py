@@ -915,17 +915,27 @@ def prepare_clarification_batch_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     ids = args.ids or _needs_human_ids_from_batch_summary(artifact_dir)
     rows: list[dict[str, Any]] = []
+    failures = 0
     for problem_id in ids:
         case_dir = artifact_dir / problem_id
         out_path = _canonical_clarification_questions_path(case_dir)
-        question_artifact = prepare_clarification_artifact(artifact_dir=case_dir, out_path=out_path, args=args)
-        rows.append(_clarification_row_from_questions(problem_id, case_dir, artifact_dir, question_artifact))
+        try:
+            question_artifact = prepare_clarification_artifact(artifact_dir=case_dir, out_path=out_path, args=args)
+            rows.append(_clarification_row_from_questions(problem_id, case_dir, artifact_dir, question_artifact))
+        except CLIError as exc:
+            failures += 1
+            rows.append(_failed_prepare_batch_row(problem_id, case_dir, artifact_dir, error=redact_text(str(exc))))
+        except Exception as exc:
+            failures += 1
+            error = redact_text(f"{type(exc).__name__}: {exc}")
+            print(f"{problem_id}: clarification prepare failed with unexpected error: {error}", file=sys.stderr)
+            rows.append(_failed_prepare_batch_row(problem_id, case_dir, artifact_dir, error=error))
 
     summary = summarize_clarification_rows(rows)
     _write_summary(artifact_dir / "clarification-summary.json", {"summary": summary, "rows": rows})
     write_clarification_report(artifact_dir / "clarification-report.md", summary, rows)
     print(f"prepared clarification for {len(rows)} case(s); wrote {artifact_dir / 'clarification-report.md'}")
-    return 0
+    return 0 if failures == 0 else 1
 
 
 def solve_clarified_batch_command(args: argparse.Namespace) -> int:
@@ -1015,6 +1025,32 @@ def _blocked_clarified_batch_row(
         "classification": "blocked_clarification",
         "verification_status": "skipped",
         "spec_fidelity_status": "not_reviewed",
+    }
+
+
+def _failed_prepare_batch_row(
+    problem_id: str,
+    case_dir: Path,
+    artifact_dir: Path,
+    *,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "problem_id": problem_id,
+        "source_artifact": _relative(case_dir, artifact_dir),
+        "baseline_block_reason": "",
+        "clarification_status": "prepare_failed",
+        "clarification_question_count": 0,
+        "clarification_answer_count": 0,
+        "clarification_source": "",
+        "clarification_gate_status": "blocked",
+        "clarification_questions": "",
+        "generated_questions": [],
+        "answer_provenance": [],
+        "classification": "blocked_clarification",
+        "verification_status": "skipped",
+        "spec_fidelity_status": "not_reviewed",
+        "error": error,
     }
 
 
