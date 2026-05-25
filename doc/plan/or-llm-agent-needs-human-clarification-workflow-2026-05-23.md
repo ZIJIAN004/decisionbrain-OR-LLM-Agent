@@ -181,36 +181,50 @@ Required summary fields:
 
 ## Implementation Checklist
 
-- [ ] Add question and answer dataclasses or typed dictionaries.
-- [ ] Add JSON loader and validator for question artifacts.
-- [ ] Add JSON loader and validator for answer artifacts.
-- [ ] Add `prepare-clarification`.
-- [ ] Add `answer-clarification`.
-- [ ] Add `solve-clarified`.
-- [ ] Add `prepare-clarification-batch`.
-- [ ] Add `solve-clarified-batch`.
-- [ ] Add prompt text for clarification-question generation.
-- [ ] Add prompt text for clarified ProblemSpec generation.
-- [ ] Update solve summaries with clarification fields.
-- [ ] Update batch summaries with clarification metrics.
-- [ ] Update fidelity review input assembly to include clarification artifacts.
-- [ ] Update CLI help text and Trellis CLI contract notes.
+- [x] Add question and answer dataclasses or typed dictionaries.
+- [x] Add JSON loader and validator for question artifacts.
+- [x] Add JSON loader and validator for answer artifacts.
+- [x] Add `prepare-clarification`.
+- [x] Add `answer-clarification`.
+- [x] Add `solve-clarified`.
+- [x] Add `prepare-clarification-batch`.
+- [x] Add `solve-clarified-batch`.
+- [x] Add prompt text for clarification-question generation.
+- [x] Add prompt text for clarified ProblemSpec generation.
+- [x] Update solve summaries with clarification fields.
+- [x] Update batch summaries with clarification metrics.
+- [x] Update fidelity review input assembly to include clarification artifacts.
+- [x] Update CLI help text and Trellis CLI contract notes.
 
 ## Verification Checklist
 
-- [ ] Unit test question schema validation.
-- [ ] Unit test answer schema validation.
-- [ ] Unit test required unanswered questions block `solve-clarified`.
-- [ ] Unit test answered required questions allow `solve-clarified`.
-- [ ] Unit test original blocked artifacts are not overwritten.
-- [ ] Unit test batch selection processes only `needs_human` cases by default.
-- [ ] Golden test for `BWOR-013` unit conflict.
-- [ ] Golden test for `BWOR-020` missing numeric truck costs.
-- [ ] Golden test for `BWOR-027` route return and distance convention.
-- [ ] Golden test for `BWOR-046` infeasible capacity-demand ambiguity.
+- [x] Unit test question schema validation.
+- [x] Unit test answer schema validation.
+- [x] Unit test required unanswered questions block `solve-clarified`.
+- [x] Unit test answered required questions allow `solve-clarified`.
+- [x] Unit test original blocked artifacts are not overwritten.
+- [x] Unit test batch selection processes only `needs_human` cases by default.
+- [x] Golden test for `BWOR-013` unit conflict.
+- [x] Golden test for `BWOR-020` missing numeric truck costs.
+- [x] Golden test for `BWOR-027` route return and distance convention.
+- [x] Golden test for `BWOR-046` infeasible capacity-demand ambiguity.
 - [ ] Pilot 4 clarified cases before running all target cases.
 - [ ] Pilot all 12 clarification-only target cases.
-- [ ] Confirm unresolved cases remain blocked rather than guessed.
+- [x] Confirm unresolved cases remain blocked rather than guessed.
+
+Progress note: live question-prep was run for the four capstone cases
+`BWOR-013`, `BWOR-020`, `BWOR-027`, and `BWOR-046` under
+`outputs/runtime/needs-human-clarification-pilot-4case/`. Full target
+question-prep was also run for all 12 clarification-only cases under
+`outputs/runtime/needs-human-clarification-pilot-12case/`. The full target run
+produced 25 reviewer questions and left all 12 cases at `awaiting_answers`; the
+clarified solve pilot still requires reviewer answer artifacts. Safe unresolved
+answer templates for those 12 cases were generated under
+`outputs/runtime/needs-human-clarification-pilot-12case/answer-templates/`.
+An unresolved-gate run was also executed in
+`outputs/runtime/needs-human-clarification-pilot-12case-unresolved-gate/`; all
+12 cases were classified as `blocked_clarification`, OR-CI was skipped, and no
+clarified artifacts were produced.
 
 ## Report Capstone Checklist
 
@@ -223,24 +237,24 @@ clarification-summary.json
 
 The Markdown report must include:
 
-- [ ] Baseline blocked reason for each attempted case.
-- [ ] Generated question set.
-- [ ] Answer provenance.
-- [ ] Clarified rerun status.
-- [ ] OR-CI verification status.
-- [ ] Fidelity status against original statement plus clarification.
-- [ ] Unresolved cases.
-- [ ] Cases that moved from `needs_human` to supported.
+- [x] Baseline blocked reason for each attempted case.
+- [x] Generated question set.
+- [x] Answer provenance.
+- [x] Clarified rerun status.
+- [x] OR-CI verification status.
+- [x] Fidelity status against original statement plus clarification.
+- [x] Unresolved cases.
+- [x] Cases that moved from `needs_human` to supported.
 
 The summary JSON must include:
 
-- [ ] attempted `needs_human` count.
-- [ ] generated question count.
-- [ ] answered question count.
-- [ ] clarified-supported case count.
-- [ ] unresolved case count.
-- [ ] OR-CI pass/fail count.
-- [ ] fidelity accepted/rejected/manual-review count.
+- [x] attempted `needs_human` count.
+- [x] generated question count.
+- [x] answered question count.
+- [x] clarified-supported case count.
+- [x] unresolved case count.
+- [x] OR-CI pass/fail count.
+- [x] fidelity accepted/rejected/manual-review count.
 
 ## Success Criteria
 
@@ -250,4 +264,3 @@ The summary JSON must include:
 - Every clarified solve has an OR-CI report.
 - Every clarified solve has fidelity review status that distinguishes clarified
   source matching from original-only source matching.
-

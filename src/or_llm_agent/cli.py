@@ -27,8 +27,11 @@ from or_llm_agent.json_blocks import extract_json_object
 from or_llm_agent.or_ci import SpecValidationResult, VerificationResult, or_ci_command, run_or_ci_validate_spec, run_or_ci_verify
 from or_llm_agent.prompts import (
     CAPABILITY_SYSTEM_PROMPT,
+    CLARIFICATION_SYSTEM_PROMPT,
     OR_CI_SYSTEM_PROMPT,
     PROBLEM_SPEC_SYSTEM_PROMPT,
+    build_clarification_question_prompt,
+    build_clarified_problem_spec_prompt,
     build_or_ci_prompt,
     build_problem_spec_prompt,
     build_statement_capability_prompt,
@@ -95,10 +98,51 @@ class SolveBatchCaseResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class ClarificationAgentResult:
+    raw_text: str
+    returncode: int
+    timed_out: bool
+    events_path: Path
+    last_message_path: Path
+    stderr: str
+
+
+@dataclass(frozen=True)
+class ClarificationQuestion:
+    id: str
+    issue_type: str
+    prompt: str
+    source_evidence: str
+    allowed_answer_type: str
+    options: tuple[str, ...]
+    required: bool
+
+
+@dataclass(frozen=True)
+class ClarificationAnswer:
+    question_id: str
+    answer: Any
+    reviewer: str
+    rationale: str
+    source: str
+
+
 FIDELITY_ACCEPTED_STATUSES = {"accepted", "llm_accepted"}
 FIDELITY_REJECTED_STATUSES = {"rejected", "llm_rejected"}
 CAPABILITY_STATUSES = {"supported", "needs_human", "unsupported"}
 CAPABILITY_BLOCKING_STATUSES = {"needs_human", "unsupported"}
+CLARIFICATION_ISSUE_TYPES = {
+    "missing_numeric_data",
+    "ambiguous_objective",
+    "unit_conflict",
+    "domain_choice",
+    "timing_convention",
+    "data_conflict",
+    "modeling_convention",
+}
+CLARIFICATION_ANSWER_TYPES = {"free_text", "single_choice", "multi_choice", "number", "boolean"}
+CLARIFICATION_RESOLUTION_STATUSES = {"answered", "partially_answered", "rejected", "unresolved"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,6 +174,16 @@ def _main(argv: list[str] | None = None) -> int:
         return solve_command(args)
     if args.command == "solve-batch":
         return solve_batch_command(args)
+    if args.command == "prepare-clarification":
+        return prepare_clarification_command(args)
+    if args.command == "answer-clarification":
+        return answer_clarification_command(args)
+    if args.command == "solve-clarified":
+        return solve_clarified_command(args)
+    if args.command == "prepare-clarification-batch":
+        return prepare_clarification_batch_command(args)
+    if args.command == "solve-clarified-batch":
+        return solve_clarified_batch_command(args)
     if args.command == "review-fidelity":
         return review_fidelity_command(args)
     if args.command == "review-fidelity-batch":
@@ -224,6 +278,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent mode: maximum number of solve cases to run concurrently; 1 preserves serial execution",
     )
     _add_agent_options(solve_batch)
+
+    prepare_clarification = subparsers.add_parser(
+        "prepare-clarification",
+        help="generate human clarification questions for a needs_human solve artifact",
+    )
+    prepare_clarification.add_argument("--artifact-dir", required=True, type=Path, help="single blocked solve artifact directory")
+    prepare_clarification.add_argument("--out", required=True, type=Path, help="question artifact JSON path")
+    _add_agent_options(prepare_clarification)
+
+    answer_clarification = subparsers.add_parser(
+        "answer-clarification",
+        help="validate and stamp human clarification answers for a blocked solve artifact",
+    )
+    answer_clarification.add_argument("--artifact-dir", required=True, type=Path, help="single blocked solve artifact directory")
+    answer_clarification.add_argument("--answers", required=True, type=Path, help="answer artifact JSON path")
+    answer_clarification.add_argument("--reviewer", required=True)
+
+    solve_clarified = subparsers.add_parser(
+        "solve-clarified",
+        help="solve a needs_human case using approved clarification answers",
+    )
+    solve_clarified.add_argument("--artifact-dir", required=True, type=Path, help="source blocked solve artifact directory")
+    solve_clarified.add_argument("--clarification", required=True, type=Path, help="answer artifact JSON path")
+    solve_clarified.add_argument("--resolution-dir", required=True, type=Path, help="separate artifact directory for the clarified run")
+    solve_clarified.add_argument("--mode", choices=("agent",), default="agent")
+    solve_clarified.add_argument("--model", default="o3-mini")
+    solve_clarified.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    _add_agent_options(solve_clarified)
+
+    prepare_clarification_batch = subparsers.add_parser(
+        "prepare-clarification-batch",
+        help="generate clarification questions for needs_human cases in a solve-batch",
+    )
+    prepare_clarification_batch.add_argument("--artifact-dir", required=True, type=Path, help="solve-batch artifact directory")
+    prepare_clarification_batch.add_argument("--ids", nargs="+")
+    _add_agent_options(prepare_clarification_batch)
+
+    solve_clarified_batch = subparsers.add_parser(
+        "solve-clarified-batch",
+        help="solve clarified needs_human cases in a solve-batch",
+    )
+    solve_clarified_batch.add_argument("--artifact-dir", required=True, type=Path, help="solve-batch artifact directory")
+    solve_clarified_batch.add_argument("--clarifications-dir", required=True, type=Path, help="directory containing answer artifacts")
+    solve_clarified_batch.add_argument("--ids", nargs="+")
+    solve_clarified_batch.add_argument("--mode", choices=("agent",), default="agent")
+    solve_clarified_batch.add_argument("--model", default="o3-mini")
+    solve_clarified_batch.add_argument("--or-ci-root", default=default_or_ci_root(), type=Path)
+    _add_agent_options(solve_clarified_batch)
 
     review = subparsers.add_parser("review-fidelity", help="record a source-statement fidelity review")
     review.add_argument("--artifact-dir", required=True, type=Path, help="single solve artifact directory")
@@ -739,6 +841,104 @@ def _run_solve_batch_case(args: argparse.Namespace, case: SolveBatchCase) -> Sol
         )
 
 
+def prepare_clarification_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    question_artifact = prepare_clarification_artifact(
+        artifact_dir=artifact_dir,
+        out_path=args.out.resolve(),
+        args=args,
+    )
+    print(
+        f"{question_artifact['problem_id']}: clarification_questions={len(question_artifact['questions'])} "
+        f"wrote={args.out}"
+    )
+    return 0
+
+
+def answer_clarification_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    questions = load_clarification_questions(_canonical_clarification_questions_path(artifact_dir))
+    answers = load_clarification_answers(args.answers.resolve(), questions=questions, reviewer=args.reviewer)
+    canonical_answers = _canonical_clarification_answers_path(artifact_dir)
+    _write_clarification_artifact(canonical_answers, answers)
+    gate_status = _clarification_gate_status(questions, answers)
+    print(
+        f"{answers['problem_id']}: clarification_status={answers['resolution_status']} "
+        f"gate={gate_status} answers={len(answers['answers'])}"
+    )
+    return 0 if gate_status == "passed" else 1
+
+
+def solve_clarified_command(args: argparse.Namespace) -> int:
+    result = solve_clarified_artifact(
+        artifact_dir=args.artifact_dir.resolve(),
+        clarification_path=args.clarification.resolve(),
+        resolution_dir=args.resolution_dir.resolve(),
+        args=args,
+    )
+    print(
+        f"{result['problem_id']}: clarification_gate={result['clarification_gate_status']} "
+        f"spec_validation={result['spec_validation_status']} verification={result['verification_status']} "
+        f"classification={result['classification']}"
+    )
+    return 0 if result["model_generation_status"] == "generated" and result["verification_status"] == "PASS" else 1
+
+
+def prepare_clarification_batch_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    ids = args.ids or _needs_human_ids_from_batch_summary(artifact_dir)
+    rows: list[dict[str, Any]] = []
+    for problem_id in ids:
+        case_dir = artifact_dir / problem_id
+        out_path = _canonical_clarification_questions_path(case_dir)
+        question_artifact = prepare_clarification_artifact(artifact_dir=case_dir, out_path=out_path, args=args)
+        rows.append(_clarification_row_from_questions(problem_id, case_dir, artifact_dir, question_artifact))
+
+    summary = summarize_clarification_rows(rows)
+    _write_summary(artifact_dir / "clarification-summary.json", {"summary": summary, "rows": rows})
+    write_clarification_report(artifact_dir / "clarification-report.md", summary, rows)
+    print(f"prepared clarification for {len(rows)} case(s); wrote {artifact_dir / 'clarification-report.md'}")
+    return 0
+
+
+def solve_clarified_batch_command(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir.resolve()
+    ids = args.ids or _needs_human_ids_from_batch_summary(artifact_dir)
+    rows: list[dict[str, Any]] = []
+    for problem_id in ids:
+        case_dir = artifact_dir / problem_id
+        clarification_path = _clarification_answers_path(args.clarifications_dir.resolve(), problem_id)
+        resolution_dir = _next_attempt_dir(artifact_dir / "clarified" / problem_id)
+        try:
+            result = solve_clarified_artifact(
+                artifact_dir=case_dir,
+                clarification_path=clarification_path,
+                resolution_dir=resolution_dir,
+                args=args,
+            )
+            rows.append(_clarification_row_from_solve(result, artifact_dir))
+        except CLIError as exc:
+            rows.append(
+                {
+                    "problem_id": problem_id,
+                    "source_artifact": _relative(case_dir, artifact_dir),
+                    "clarification_status": "unresolved",
+                    "clarification_gate_status": "blocked",
+                    "error": redact_text(str(exc)),
+                    "resolution_artifact": _relative(resolution_dir, artifact_dir),
+                    "classification": "blocked_clarification",
+                    "verification_status": "skipped",
+                    "spec_fidelity_status": "not_reviewed",
+                }
+            )
+
+    summary = summarize_clarification_rows(rows)
+    _write_summary(artifact_dir / "clarification-summary.json", {"summary": summary, "rows": rows})
+    write_clarification_report(artifact_dir / "clarification-report.md", summary, rows)
+    print(f"solved clarified {len(rows)} case(s); wrote {artifact_dir / 'clarification-report.md'}")
+    return 0 if all(row.get("clarification_gate_status") == "passed" and row.get("verification_status") == "PASS" for row in rows) else 1
+
+
 def review_fidelity_command(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir.resolve()
     review = _fidelity_review_payload_for_artifact(artifact_dir, args)
@@ -859,6 +1059,238 @@ def classify_statement(
     return payload
 
 
+def prepare_clarification_artifact(
+    *,
+    artifact_dir: Path,
+    out_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    summary = _read_json_object(artifact_dir / "summary.json")
+    if not summary:
+        raise CLIError(f"solve summary does not exist or is not valid JSON: {artifact_dir / 'summary.json'}")
+    if summary.get("capability_status") != "needs_human":
+        raise CLIError(
+            f"clarification can only be prepared for capability_status=needs_human; "
+            f"found {summary.get('capability_status', 'unknown')}"
+        )
+
+    problem_id = str(summary.get("problem_id") or artifact_dir.name)
+    statement_path = _artifact_path(artifact_dir, summary.get("statement_file"), "statement.txt")
+    statement = _read_statement(statement_path)
+    capability_path = _artifact_path(artifact_dir, summary.get("capability"), "spec/capability.json")
+    capability = _read_json_object(capability_path)
+    raw_path = artifact_dir / "raw" / "clarification-questions.txt"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+
+    agent_result = _run_clarification_question_agent(
+        problem_id=problem_id,
+        statement=statement,
+        capability=capability,
+        artifact_dir=artifact_dir,
+        args=args,
+    )
+    raw_text = redact_text(agent_result.raw_text).rstrip() + "\n"
+    raw_path.write_text(raw_text, encoding="utf-8")
+
+    parsed = extract_json_object(agent_result.raw_text)
+    if isinstance(parsed, dict):
+        parsed["problem_id"] = problem_id
+        parsed["source_artifact"] = _portable_source_artifact(artifact_dir)
+        parsed["blocking_status"] = "needs_human"
+        payload = normalize_clarification_questions(parsed, source_path=out_path)
+    else:
+        payload = _fallback_clarification_questions(
+            problem_id=problem_id,
+            artifact_dir=artifact_dir,
+            capability=capability,
+            raw_path=raw_path,
+            agent_result=agent_result,
+        )
+
+    payload["raw_response"] = str(raw_path)
+    payload["agent_returncode"] = agent_result.returncode
+    payload["agent_timed_out"] = agent_result.timed_out
+    payload["codex_events"] = str(agent_result.events_path)
+    payload["last_message"] = str(agent_result.last_message_path)
+    payload["agent_stderr"] = redact_text(agent_result.stderr)
+    _write_clarification_artifact(out_path, payload)
+    canonical = _canonical_clarification_questions_path(artifact_dir)
+    if canonical.resolve() != out_path.resolve():
+        _write_clarification_artifact(canonical, payload)
+    return payload
+
+
+def solve_clarified_artifact(
+    *,
+    artifact_dir: Path,
+    clarification_path: Path,
+    resolution_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if resolution_dir.resolve() == artifact_dir.resolve():
+        raise CLIError(
+            "solve-clarified requires --resolution-dir to be different from --artifact-dir "
+            f"so the blocked source artifact is preserved: {artifact_dir}"
+        )
+
+    source_summary = _read_json_object(artifact_dir / "summary.json")
+    if not source_summary:
+        raise CLIError(f"solve summary does not exist or is not valid JSON: {artifact_dir / 'summary.json'}")
+    if source_summary.get("capability_status") != "needs_human":
+        raise CLIError(
+            f"solve-clarified requires source capability_status=needs_human; "
+            f"found {source_summary.get('capability_status', 'unknown')}"
+        )
+
+    questions = load_clarification_questions(_canonical_clarification_questions_path(artifact_dir))
+    answers = load_clarification_answers(clarification_path, questions=questions)
+    gate_status = _clarification_gate_status(questions, answers)
+    if gate_status != "passed":
+        missing = _required_unanswered_question_ids(questions, answers)
+        suffix = f"; missing required answers: {', '.join(missing)}" if missing else ""
+        raise CLIError(f"clarification gate is {gate_status}{suffix}")
+
+    problem_id = str(source_summary.get("problem_id") or artifact_dir.name)
+    statement_path = _artifact_path(artifact_dir, source_summary.get("statement_file"), "statement.txt")
+    statement = _read_statement(statement_path)
+    clarification_context = _clarification_context(
+        source_artifact_dir=artifact_dir,
+        resolution_dir=resolution_dir,
+        questions=questions,
+        answers=answers,
+        question_path=_canonical_clarification_questions_path(artifact_dir),
+        answer_path=clarification_path,
+        gate_status=gate_status,
+    )
+    clarified_statement = _statement_with_clarification(statement, clarification_context)
+
+    spec_dir = resolution_dir / "spec"
+    submissions_dir = resolution_dir / "submissions"
+    raw_dir = resolution_dir / "raw"
+    reports_dir = resolution_dir / "reports"
+    clarification_dir = resolution_dir / "clarification"
+    for directory in (spec_dir, submissions_dir, raw_dir, reports_dir, resolution_dir / "sessions", clarification_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    copied_questions = clarification_dir / "questions.json"
+    copied_answers = clarification_dir / "answers.json"
+    _write_clarification_artifact(copied_questions, questions)
+    _write_clarification_artifact(copied_answers, answers)
+    clarification_context["question_artifact"] = _relative(copied_questions, resolution_dir)
+    clarification_context["answer_artifact"] = _relative(copied_answers, resolution_dir)
+
+    problem_path = spec_dir / "problem.json"
+    spec_raw_path = raw_dir / "spec.txt"
+    spec_status_path = spec_dir / "status.json"
+    spec_fidelity_review_path = spec_dir / "fidelity-review.md"
+    spec_fidelity_report_path = spec_dir / "fidelity-review.json"
+    spec_result = generate_problem_spec(
+        problem_id=problem_id,
+        statement=statement,
+        out_path=problem_path,
+        raw_path=spec_raw_path,
+        status_path=spec_status_path,
+        artifact_dir=resolution_dir,
+        args=args,
+        clarification_context=clarification_context,
+    )
+
+    summary: dict[str, Any] = {
+        "problem_id": problem_id,
+        "statement_file": str(statement_path),
+        "source_artifact": str(artifact_dir),
+        "resolution_artifact": str(resolution_dir),
+        "clarified_from": str(artifact_dir),
+        "clarification_status": answers["resolution_status"],
+        "clarification_question_count": len(questions["questions"]),
+        "clarification_answer_count": len(answers["answers"]),
+        "clarification_source": _clarification_source(answers),
+        "clarification_gate_status": gate_status,
+        "clarification_questions": _relative(copied_questions, resolution_dir),
+        "clarification_answers": _relative(copied_answers, resolution_dir),
+        "spec": _relative(problem_path, resolution_dir),
+        "spec_raw": _relative(spec_raw_path, resolution_dir),
+        "spec_status": _relative(spec_status_path, resolution_dir),
+        "spec_generation_status": spec_result["spec_generation_status"],
+        "spec_validation_status": spec_result["spec_validation_status"],
+        "spec_generation_error": spec_result.get("generation_error", ""),
+        "spec_validation_returncode": spec_result.get("validation_returncode"),
+        "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
+        "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        "spec_fidelity_status": "not_reviewed",
+        "spec_fidelity_review": _relative(spec_fidelity_review_path, resolution_dir),
+        "spec_fidelity_report": _relative(spec_fidelity_report_path, resolution_dir),
+        "model_generation_status": "skipped",
+        "verification_status": "skipped",
+        "classification": "skipped",
+    }
+
+    if not _spec_is_ready(spec_result):
+        summary["reason"] = "clarified spec validation failed; model generation skipped"
+        _write_spec_fidelity_review(
+            spec_fidelity_review_path,
+            report_path=spec_fidelity_report_path,
+            summary=summary,
+            statement=statement,
+            problem_path=problem_path,
+            clarification_context=clarification_context,
+        )
+        _write_summary(resolution_dir / "summary.json", summary)
+        return summary
+
+    inputs = GenerationInputs(
+        problem_id=problem_id,
+        record={"id": problem_id, "en_question": clarified_statement},
+        problem_path=problem_path,
+        problem=load_problem(problem_path),
+    )
+    submission_path = submissions_dir / f"{problem_id}.py"
+    model_raw_path = raw_dir / f"{problem_id}.txt"
+    report_path = reports_dir / f"{problem_id}.json"
+    generation = generate_agent_submission(
+        inputs=inputs,
+        paths=build_agent_paths(
+            problem_id=problem_id,
+            artifact_root=resolution_dir,
+            submission_path=submission_path,
+            raw_path=model_raw_path,
+            report_path=report_path,
+        ),
+        args=args,
+    )
+    verification = run_or_ci_verify(
+        problem_path=problem_path,
+        submission_path=submission_path,
+        report_path=report_path,
+        cwd=repo_root(),
+    )
+    summary.update(
+        {
+            "submission": _relative(submission_path, resolution_dir),
+            "model_raw": _relative(model_raw_path, resolution_dir),
+            "report": _relative(report_path, resolution_dir),
+            "model_generation_status": generation["generation_status"],
+            "model_generation_error": generation["generation_error"],
+            "verification_status": verification.status,
+            "classification": verification.classification,
+            "verification_note": "passed clarified generated spec" if verification.status == "PASS" else "failed clarified generated spec",
+            "verify_returncode": verification.returncode,
+            "verify_stdout": verification.stdout,
+            "verify_stderr": verification.stderr,
+        }
+    )
+    _write_spec_fidelity_review(
+        spec_fidelity_review_path,
+        report_path=spec_fidelity_report_path,
+        summary=summary,
+        statement=statement,
+        problem_path=problem_path,
+        clarification_context=clarification_context,
+    )
+    _write_summary(resolution_dir / "summary.json", summary)
+    return summary
+
+
 def generate_problem_spec(
     *,
     problem_id: str,
@@ -871,6 +1303,7 @@ def generate_problem_spec(
     initial_previous_problem: dict[str, Any] | None = None,
     initial_previous_response: str = "",
     initial_repair_error: str = "",
+    clarification_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -893,6 +1326,7 @@ def generate_problem_spec(
             previous_problem=previous_problem,
             previous_response=previous_response,
             repair_error=repair_error,
+            clarification_context=clarification_context,
         )
         raw_text = redact_text(agent_result.raw_text).rstrip() + "\n"
         attempt_raw_path = _spec_attempt_raw_path(raw_path, attempt)
@@ -930,6 +1364,8 @@ def generate_problem_spec(
             repair_error = generation_error
             continue
 
+        if clarification_context is not None:
+            _mark_problem_as_clarified(problem, clarification_context)
         out_path.write_text(json.dumps(problem, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         validation = run_or_ci_validate_spec(problem_path=out_path, cwd=repo_root())
         attempt_payload.update(_spec_validation_payload(validation))
@@ -963,6 +1399,17 @@ def generate_problem_spec(
     for key in ("validation_returncode", "validation_stdout", "validation_stderr"):
         if key in final_attempt:
             payload[key] = final_attempt[key]
+    if clarification_context is not None:
+        payload.update(
+            {
+                "clarified": True,
+                "clarified_from": clarification_context.get("clarified_from", ""),
+                "clarification_status": clarification_context.get("clarification_status", ""),
+                "clarification_gate_status": clarification_context.get("clarification_gate_status", ""),
+                "clarification_question_count": clarification_context.get("clarification_question_count", 0),
+                "clarification_answer_count": clarification_context.get("clarification_answer_count", 0),
+            }
+        )
     _write_summary(status_path, payload)
     return payload
 
@@ -1476,6 +1923,357 @@ def _capability_summary_fields(result: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def load_clarification_questions(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise CLIError(f"clarification question artifact does not exist: {path}; run prepare-clarification first")
+    return normalize_clarification_questions(_read_json_object(path), source_path=path)
+
+
+def normalize_clarification_questions(payload: dict[str, Any], *, source_path: Path) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        raise CLIError(f"clarification question artifact is not a JSON object: {source_path}")
+    problem_id = _required_text(payload, "problem_id", context=str(source_path))
+    source_artifact = _required_text(payload, "source_artifact", context=str(source_path))
+    blocking_status = _required_text(payload, "blocking_status", context=str(source_path))
+    if blocking_status != "needs_human":
+        raise CLIError(f"clarification question artifact blocking_status must be needs_human: {source_path}")
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        raise CLIError(f"clarification question artifact must contain a non-empty questions list: {source_path}")
+
+    questions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw_question in enumerate(raw_questions, 1):
+        if not isinstance(raw_question, dict):
+            raise CLIError(f"clarification question #{index} must be an object: {source_path}")
+        question = _normalize_clarification_question(raw_question, source_path=source_path)
+        if question.id in seen_ids:
+            raise CLIError(f"duplicate clarification question id {question.id!r}: {source_path}")
+        seen_ids.add(question.id)
+        questions.append(
+            {
+                "id": question.id,
+                "issue_type": question.issue_type,
+                "prompt": question.prompt,
+                "source_evidence": question.source_evidence,
+                "allowed_answer_type": question.allowed_answer_type,
+                "options": list(question.options),
+                "required": question.required,
+            }
+        )
+
+    normalized = {
+        "problem_id": problem_id,
+        "source_artifact": source_artifact,
+        "blocking_status": blocking_status,
+        "questions": questions,
+    }
+    for key in ("raw_response", "agent_returncode", "agent_timed_out", "codex_events", "last_message", "agent_stderr"):
+        if key in payload:
+            normalized[key] = payload[key]
+    return normalized
+
+
+def _normalize_clarification_question(raw_question: dict[str, Any], *, source_path: Path) -> ClarificationQuestion:
+    question_id = _required_text(raw_question, "id", context=str(source_path))
+    issue_type = _required_text(raw_question, "issue_type", context=str(source_path))
+    if issue_type not in CLARIFICATION_ISSUE_TYPES:
+        raise CLIError(f"unsupported clarification issue_type {issue_type!r}: {source_path}")
+    prompt = _required_text(raw_question, "prompt", context=str(source_path))
+    source_evidence = _required_text(raw_question, "source_evidence", context=str(source_path))
+    allowed_answer_type = _required_text(raw_question, "allowed_answer_type", context=str(source_path))
+    if allowed_answer_type not in CLARIFICATION_ANSWER_TYPES:
+        raise CLIError(f"unsupported clarification allowed_answer_type {allowed_answer_type!r}: {source_path}")
+    options_value = raw_question.get("options", [])
+    if not isinstance(options_value, list) or not all(isinstance(item, str) and item for item in options_value):
+        raise CLIError(f"clarification question {question_id!r} options must be a list of strings: {source_path}")
+    if allowed_answer_type in {"single_choice", "multi_choice"} and not options_value:
+        raise CLIError(f"clarification question {question_id!r} requires non-empty options: {source_path}")
+    required_value = raw_question.get("required", True)
+    if not isinstance(required_value, bool):
+        raise CLIError(f"clarification question {question_id!r} required must be boolean: {source_path}")
+    return ClarificationQuestion(
+        id=question_id,
+        issue_type=issue_type,
+        prompt=prompt,
+        source_evidence=source_evidence,
+        allowed_answer_type=allowed_answer_type,
+        options=tuple(options_value),
+        required=required_value,
+    )
+
+
+def load_clarification_answers(
+    path: Path,
+    *,
+    questions: dict[str, Any],
+    reviewer: str | None = None,
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise CLIError(f"clarification answer artifact does not exist: {path}")
+    payload = _read_json_object(path)
+    if not payload:
+        raise CLIError(f"clarification answer artifact is not a JSON object: {path}")
+    problem_id = _required_text(payload, "problem_id", context=str(path))
+    if problem_id != questions["problem_id"]:
+        raise CLIError(
+            f"clarification answer problem_id {problem_id!r} does not match questions problem_id "
+            f"{questions['problem_id']!r}: {path}"
+        )
+    raw_status = payload.get("resolution_status", "answered")
+    resolution_status = str(raw_status).strip() if isinstance(raw_status, str) else ""
+    if resolution_status not in CLARIFICATION_RESOLUTION_STATUSES:
+        raise CLIError(f"unsupported clarification resolution_status {resolution_status!r}: {path}")
+    raw_answers = payload.get("answers")
+    if not isinstance(raw_answers, list):
+        raise CLIError(f"clarification answer artifact must contain an answers list: {path}")
+
+    questions_by_id = {question["id"]: question for question in questions["questions"]}
+    answers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw_answer in enumerate(raw_answers, 1):
+        if not isinstance(raw_answer, dict):
+            raise CLIError(f"clarification answer #{index} must be an object: {path}")
+        answer = _normalize_clarification_answer(
+            raw_answer,
+            questions_by_id=questions_by_id,
+            reviewer=reviewer,
+            source_path=path,
+        )
+        if answer.question_id in seen:
+            raise CLIError(f"duplicate clarification answer for question {answer.question_id!r}: {path}")
+        seen.add(answer.question_id)
+        answers.append(
+            {
+                "question_id": answer.question_id,
+                "answer": answer.answer,
+                "reviewer": answer.reviewer,
+                "rationale": answer.rationale,
+                "source": answer.source,
+            }
+        )
+
+    normalized = {
+        "problem_id": problem_id,
+        "answers": answers,
+        "resolution_status": resolution_status,
+    }
+    missing = _required_unanswered_question_ids(questions, normalized)
+    if missing and resolution_status == "answered":
+        normalized["resolution_status"] = "partially_answered"
+    return normalized
+
+
+def _normalize_clarification_answer(
+    raw_answer: dict[str, Any],
+    *,
+    questions_by_id: dict[str, dict[str, Any]],
+    reviewer: str | None,
+    source_path: Path,
+) -> ClarificationAnswer:
+    question_id = _required_text(raw_answer, "question_id", context=str(source_path))
+    if question_id not in questions_by_id:
+        raise CLIError(f"clarification answer references unknown question_id {question_id!r}: {source_path}")
+    if "answer" not in raw_answer or _is_empty_answer(raw_answer.get("answer")):
+        raise CLIError(f"clarification answer for {question_id!r} is empty: {source_path}")
+    question = questions_by_id[question_id]
+    answer_value = raw_answer.get("answer")
+    answer_type = question["allowed_answer_type"]
+    options = question.get("options", [])
+    if answer_type == "single_choice" and answer_value not in options:
+        raise CLIError(f"clarification answer for {question_id!r} must be one of {options}: {source_path}")
+    if answer_type == "multi_choice":
+        if not isinstance(answer_value, list) or not answer_value or not all(item in options for item in answer_value):
+            raise CLIError(f"clarification answer for {question_id!r} must be a non-empty subset of {options}: {source_path}")
+    if answer_type == "number" and (isinstance(answer_value, bool) or not isinstance(answer_value, (int, float))):
+        raise CLIError(f"clarification answer for {question_id!r} must be numeric: {source_path}")
+    if answer_type == "boolean" and not isinstance(answer_value, bool):
+        raise CLIError(f"clarification answer for {question_id!r} must be boolean: {source_path}")
+
+    reviewer_value = raw_answer.get("reviewer") or reviewer
+    if not isinstance(reviewer_value, str) or not reviewer_value.strip():
+        raise CLIError(f"clarification answer for {question_id!r} requires a reviewer: {source_path}")
+    rationale = raw_answer.get("rationale", "")
+    if not isinstance(rationale, str):
+        raise CLIError(f"clarification answer rationale for {question_id!r} must be a string: {source_path}")
+    source = raw_answer.get("source", "manual_review")
+    if not isinstance(source, str) or not source.strip():
+        raise CLIError(f"clarification answer source for {question_id!r} must be a non-empty string: {source_path}")
+    return ClarificationAnswer(
+        question_id=question_id,
+        answer=answer_value,
+        reviewer=reviewer_value.strip(),
+        rationale=rationale.strip(),
+        source=source.strip(),
+    )
+
+
+def _required_text(payload: dict[str, Any], key: str, *, context: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise CLIError(f"{key} must be a non-empty string in {context}")
+    return value.strip()
+
+
+def _is_empty_answer(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return not value
+    return False
+
+
+def _required_unanswered_question_ids(questions: dict[str, Any], answers: dict[str, Any]) -> list[str]:
+    answered = {
+        str(answer.get("question_id"))
+        for answer in answers.get("answers", [])
+        if isinstance(answer, dict) and not _is_empty_answer(answer.get("answer"))
+    }
+    return [
+        str(question["id"])
+        for question in questions.get("questions", [])
+        if isinstance(question, dict) and question.get("required", True) and question.get("id") not in answered
+    ]
+
+
+def _clarification_gate_status(questions: dict[str, Any], answers: dict[str, Any]) -> str:
+    status = answers.get("resolution_status")
+    if status == "rejected":
+        return "blocked_rejected"
+    if status == "unresolved":
+        return "blocked_unresolved"
+    if _required_unanswered_question_ids(questions, answers):
+        return "blocked_unanswered_required"
+    return "passed"
+
+
+def _clarification_source(answers: dict[str, Any]) -> str:
+    sources = sorted(
+        {
+            str(answer.get("source")).strip()
+            for answer in answers.get("answers", [])
+            if isinstance(answer, dict) and str(answer.get("source", "")).strip()
+        }
+    )
+    return ", ".join(sources) if sources else "unknown"
+
+
+def _canonical_clarification_questions_path(artifact_dir: Path) -> Path:
+    return artifact_dir / "clarification" / "questions.json"
+
+
+def _canonical_clarification_answers_path(artifact_dir: Path) -> Path:
+    return artifact_dir / "clarification" / "answers.json"
+
+
+def _write_clarification_artifact(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _fallback_clarification_questions(
+    *,
+    problem_id: str,
+    artifact_dir: Path,
+    capability: dict[str, Any],
+    raw_path: Path,
+    agent_result: ClarificationAgentResult,
+) -> dict[str, Any]:
+    missing_information = _string_list(capability.get("missing_information"))
+    review_note = str(capability.get("review_note") or "Capability classifier could not safely continue.")
+    issues = missing_information or [review_note]
+    questions = []
+    for index, issue in enumerate(issues, 1):
+        questions.append(
+            {
+                "id": f"q{index}",
+                "issue_type": _infer_clarification_issue_type(issue),
+                "prompt": f"Please clarify this blocking issue before ProblemSpec generation: {issue}",
+                "source_evidence": issue,
+                "allowed_answer_type": "free_text",
+                "options": [],
+                "required": True,
+            }
+        )
+    return {
+        "problem_id": problem_id,
+        "source_artifact": _portable_source_artifact(artifact_dir),
+        "blocking_status": "needs_human",
+        "questions": questions,
+        "raw_response": str(raw_path),
+        "agent_returncode": agent_result.returncode,
+        "agent_timed_out": agent_result.timed_out,
+        "codex_events": str(agent_result.events_path),
+        "last_message": str(agent_result.last_message_path),
+        "agent_stderr": redact_text(agent_result.stderr),
+    }
+
+
+def _infer_clarification_issue_type(issue: str) -> str:
+    text = issue.lower()
+    if any(token in text for token in ("unit", "yuan", "dollar", "kg", "ton", "thousand", "million")):
+        return "unit_conflict"
+    if any(token in text for token in ("cost", "coefficient", "numeric", "value", "missing", "symbolic")):
+        return "missing_numeric_data"
+    if "objective" in text:
+        return "ambiguous_objective"
+    if any(token in text for token in ("time", "period", "year", "return")):
+        return "timing_convention"
+    if any(token in text for token in ("conflict", "contradict")):
+        return "data_conflict"
+    return "modeling_convention"
+
+
+def _clarification_context(
+    *,
+    source_artifact_dir: Path,
+    resolution_dir: Path,
+    questions: dict[str, Any],
+    answers: dict[str, Any],
+    question_path: Path,
+    answer_path: Path,
+    gate_status: str,
+) -> dict[str, Any]:
+    return {
+        "clarified": True,
+        "clarified_from": str(source_artifact_dir),
+        "clarification_status": answers["resolution_status"],
+        "clarification_gate_status": gate_status,
+        "clarification_question_count": len(questions["questions"]),
+        "clarification_answer_count": len(answers["answers"]),
+        "clarification_source": _clarification_source(answers),
+        "question_artifact": _relative(question_path, resolution_dir),
+        "answer_artifact": _relative(answer_path, resolution_dir),
+        "questions": questions["questions"],
+        "answers": answers["answers"],
+    }
+
+
+def _statement_with_clarification(statement: str, clarification_context: dict[str, Any]) -> str:
+    return (
+        f"{statement.strip()}\n\n"
+        "Approved clarification context for this run:\n"
+        f"{json.dumps(clarification_context, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _mark_problem_as_clarified(problem: dict[str, Any], clarification_context: dict[str, Any]) -> None:
+    source_context = problem.get("source_context") if isinstance(problem.get("source_context"), dict) else {}
+    source_context.update(
+        {
+            "clarified": True,
+            "clarified_from": clarification_context.get("clarified_from", ""),
+            "clarification_status": clarification_context.get("clarification_status", ""),
+            "clarification_gate_status": clarification_context.get("clarification_gate_status", ""),
+            "clarification_question_count": clarification_context.get("clarification_question_count", 0),
+            "clarification_answer_count": clarification_context.get("clarification_answer_count", 0),
+        }
+    )
+    problem["source_context"] = source_context
+
+
 def build_pilot_row(
     *,
     artifact_dir: Path,
@@ -1531,7 +2329,11 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     fidelity_gate_statuses: dict[str, int] = {}
     fidelity_resolution_statuses: dict[str, int] = {}
     fidelity_resolution_impacts: dict[str, int] = {}
+    clarification_statuses: dict[str, int] = {}
+    clarification_gate_statuses: dict[str, int] = {}
     exit_codes: dict[str, int] = {}
+    clarification_question_count = 0
+    clarification_answer_count = 0
     for row in rows:
         classifications[row["classification"]] = classifications.get(row["classification"], 0) + 1
         capability_status = row.get("capability_status", "unknown")
@@ -1548,6 +2350,14 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if row.get("fidelity_resolution_impact_classification"):
             impact = str(row["fidelity_resolution_impact_classification"])
             fidelity_resolution_impacts[impact] = fidelity_resolution_impacts.get(impact, 0) + 1
+        if row.get("clarification_status"):
+            status = str(row["clarification_status"])
+            clarification_statuses[status] = clarification_statuses.get(status, 0) + 1
+        if row.get("clarification_gate_status"):
+            gate = str(row["clarification_gate_status"])
+            clarification_gate_statuses[gate] = clarification_gate_statuses.get(gate, 0) + 1
+        clarification_question_count += int(row.get("clarification_question_count") or 0)
+        clarification_answer_count += int(row.get("clarification_answer_count") or 0)
         exit_key = str(row["exit_code"])
         exit_codes[exit_key] = exit_codes.get(exit_key, 0) + 1
     return {
@@ -1562,7 +2372,53 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "spec_fidelity_gate_statuses": fidelity_gate_statuses,
         "fidelity_resolution_statuses": fidelity_resolution_statuses,
         "fidelity_resolution_impacts": fidelity_resolution_impacts,
+        "clarification_statuses": clarification_statuses,
+        "clarification_gate_statuses": clarification_gate_statuses,
+        "clarification_question_count": clarification_question_count,
+        "clarification_answer_count": clarification_answer_count,
         "exit_codes": exit_codes,
+    }
+
+
+def summarize_clarification_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    gates: dict[str, int] = {}
+    classifications: dict[str, int] = {}
+    or_ci_statuses: dict[str, int] = {}
+    fidelity_statuses: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("clarification_status", "questions_prepared"))
+        gate = str(row.get("clarification_gate_status", "awaiting_answers"))
+        classification = str(row.get("classification", "not_run"))
+        or_ci_status = str(row.get("verification_status", "not_run"))
+        fidelity_status = str(row.get("spec_fidelity_status", "not_reviewed"))
+        statuses[status] = statuses.get(status, 0) + 1
+        gates[gate] = gates.get(gate, 0) + 1
+        classifications[classification] = classifications.get(classification, 0) + 1
+        or_ci_statuses[or_ci_status] = or_ci_statuses.get(or_ci_status, 0) + 1
+        fidelity_statuses[fidelity_status] = fidelity_statuses.get(fidelity_status, 0) + 1
+    return {
+        "attempted_needs_human_count": len(rows),
+        "generated_question_count": sum(int(row.get("clarification_question_count") or 0) for row in rows),
+        "answered_question_count": sum(int(row.get("clarification_answer_count") or 0) for row in rows),
+        "clarified_supported_case_count": sum(
+            1
+            for row in rows
+            if row.get("clarification_gate_status") == "passed"
+            and row.get("verification_status") == "PASS"
+            and row.get("classification") == "SUCCESS"
+        ),
+        "unresolved_case_count": sum(
+            1
+            for row in rows
+            if row.get("clarification_gate_status") not in {"passed", "awaiting_answers"}
+            or row.get("classification") == "blocked_clarification"
+        ),
+        "or_ci_statuses": or_ci_statuses,
+        "fidelity_statuses": fidelity_statuses,
+        "clarification_statuses": statuses,
+        "clarification_gate_statuses": gates,
+        "classifications": classifications,
     }
 
 
@@ -1678,6 +2534,100 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
     )
 
 
+def write_clarification_report(path: Path, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    matrix = [
+        "| Problem | Baseline Block | Questions | Answers | Answer Source | Gate | Clarified Status | OR-CI | Fidelity | Artifact |",
+        "|---|---|---:|---:|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        matrix.append(
+            f"| {row['problem_id']} | `{row.get('baseline_block_reason', '')}` | "
+            f"`{row.get('clarification_question_count', 0)}` | `{row.get('clarification_answer_count', 0)}` | "
+            f"`{row.get('clarification_source', '')}` | `{row.get('clarification_gate_status', '')}` | "
+            f"`{row.get('classification', 'not_run')}` | "
+            f"`{row.get('verification_status', 'not_run')}` | `{row.get('spec_fidelity_status', 'not_reviewed')}` | "
+            f"`{row.get('resolution_artifact') or row.get('source_artifact', '')}` |"
+        )
+    unresolved = [
+        row["problem_id"]
+        for row in rows
+        if row.get("clarification_gate_status") not in {"passed", "awaiting_answers"}
+        or row.get("classification") in {"blocked_clarification", "skipped"}
+    ]
+    moved = [
+        row["problem_id"]
+        for row in rows
+        if row.get("clarification_gate_status") == "passed"
+        and row.get("verification_status") == "PASS"
+        and row.get("classification") == "SUCCESS"
+    ]
+    detail_sections = [_clarification_report_detail(row) for row in rows]
+    path.write_text(
+        f"""# Clarification Report
+
+## Summary
+
+```json
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+```
+
+## Matrix
+
+{chr(10).join(matrix)}
+
+## Unresolved Cases
+
+{", ".join(unresolved) if unresolved else "None."}
+
+## Moved From `needs_human` To Supported
+
+{", ".join(moved) if moved else "None."}
+
+## Case Details
+
+{chr(10).join(detail_sections) if detail_sections else "None."}
+
+## Interpretation Notes
+
+- Baseline block reason comes from the original capability gate.
+- Clarified runs are written to separate resolution artifacts; source blocked artifacts are not overwritten.
+- OR-CI `PASS` still verifies the generated clarified ProblemSpec, not the source statement by itself.
+- Fidelity must be reviewed against the original statement plus approved clarification answers.
+""",
+        encoding="utf-8",
+    )
+
+
+def _clarification_report_detail(row: dict[str, Any]) -> str:
+    question_lines = [
+        f"- `{item.get('id', '')}` `{item.get('issue_type', '')}`: {item.get('prompt', '')} "
+        f"(evidence: {item.get('source_evidence', '')})"
+        for item in row.get("generated_questions", [])
+        if isinstance(item, dict)
+    ] or ["- None recorded."]
+    answer_lines = [
+        f"- `{item.get('question_id', '')}` reviewer=`{item.get('reviewer', '')}` "
+        f"source=`{item.get('source', '')}` rationale={item.get('rationale', '')}"
+        for item in row.get("answer_provenance", [])
+        if isinstance(item, dict)
+    ] or ["- None recorded."]
+    return f"""### {row.get('problem_id', 'unknown')}
+
+- Baseline block reason: {row.get('baseline_block_reason', '')}
+- Clarified rerun status: `{row.get('classification', 'not_run')}`
+- OR-CI verification status: `{row.get('verification_status', 'not_run')}`
+- Fidelity status: `{row.get('spec_fidelity_status', 'not_reviewed')}`
+
+Generated question set:
+
+{chr(10).join(question_lines)}
+
+Answer provenance:
+
+{chr(10).join(answer_lines)}
+"""
+
+
 def _batch_statement_file(args: argparse.Namespace, artifact_dir: Path, problem_id: str) -> Path:
     if args.statements_dir:
         candidate = args.statements_dir / f"{problem_id}.txt"
@@ -1754,6 +2704,14 @@ def _solve_batch_row(
         "fidelity_resolution_report",
         "fidelity_resolution_repaired_fidelity_status",
         "fidelity_resolution_impact_classification",
+        "clarified_from",
+        "clarification_status",
+        "clarification_question_count",
+        "clarification_answer_count",
+        "clarification_source",
+        "clarification_gate_status",
+        "clarification_questions",
+        "clarification_answers",
         "submission",
         "report",
     ):
@@ -1983,10 +2941,14 @@ def _build_fidelity_review_agent_prompt(*, artifact_dir: Path, summary: dict[str
     problem_path = _artifact_path(artifact_dir, summary.get("spec"), "spec/problem.json")
     report_path = _artifact_path(artifact_dir, summary.get("report"), "reports/report.json")
     fidelity_report_path = _artifact_path(artifact_dir, summary.get("spec_fidelity_report"), "spec/fidelity-review.json")
+    clarification_questions_path = _artifact_path(artifact_dir, summary.get("clarification_questions"), "clarification/questions.json")
+    clarification_answers_path = _artifact_path(artifact_dir, summary.get("clarification_answers"), "clarification/answers.json")
     statement = _read_optional_text(statement_path)
     problem_text = _read_optional_text(problem_path)
     report_text = _read_optional_text(report_path)
     fidelity_text = _read_optional_text(fidelity_report_path)
+    clarification_questions_text = _read_optional_text(clarification_questions_path)
+    clarification_answers_text = _read_optional_text(clarification_answers_path)
 
     return f"""You are running as a nested Codex agent for OR-LLM-Agent `review-fidelity --mode agent`.
 
@@ -2007,6 +2969,7 @@ Required JSON shape:
 
 Decision rules:
 - Accept only when the generated `instance`, objective sense and coefficients, constraint families and bounds, and metamorphic paths are faithful to the source statement.
+- If clarification artifacts are present, evaluate fidelity against the original statement plus approved clarification answers.
 - OR-CI `PASS` proves only that the generated submission passed the generated spec. It does not prove that the spec matches the original statement.
 - Reject if a value, set, objective, constraint, or important metamorphic path is missing, ambiguous, invented, or materially changed.
 - Reject if the generated spec validation or model verification did not pass.
@@ -2035,6 +2998,16 @@ OR-CI verification report from `{report_path}`:
 Existing fidelity report from `{fidelity_report_path}`:
 ```json
 {_trim_for_prompt(fidelity_text, 6000)}
+```
+
+Clarification questions from `{clarification_questions_path}`:
+```json
+{_trim_for_prompt(clarification_questions_text, 6000)}
+```
+
+Clarification answers from `{clarification_answers_path}`:
+```json
+{_trim_for_prompt(clarification_answers_text, 6000)}
 ```
 """
 
@@ -2188,6 +3161,132 @@ def _batch_ids_from_summary(artifact_dir: Path) -> list[str]:
     return ids
 
 
+def _needs_human_ids_from_batch_summary(artifact_dir: Path) -> list[str]:
+    summary_path = artifact_dir / "summary.json"
+    if not summary_path.is_file():
+        raise CLIError(f"batch summary does not exist: {summary_path}")
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise CLIError(f"batch summary contains no rows: {summary_path}")
+    ids = [
+        str(row.get("problem_id"))
+        for row in rows
+        if isinstance(row, dict) and row.get("problem_id") and row.get("capability_status") == "needs_human"
+    ]
+    if not ids:
+        raise CLIError(f"batch summary contains no needs_human cases: {summary_path}")
+    return ids
+
+
+def _clarification_answers_path(clarifications_dir: Path, problem_id: str) -> Path:
+    candidates = [
+        clarifications_dir / f"{problem_id}.json",
+        clarifications_dir / problem_id / "answers.json",
+        clarifications_dir / problem_id / "clarification" / "answers.json",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _clarification_row_from_questions(
+    problem_id: str,
+    case_dir: Path,
+    artifact_dir: Path,
+    question_artifact: dict[str, Any],
+) -> dict[str, Any]:
+    source_summary = _read_json_object(case_dir / "summary.json")
+    return {
+        "problem_id": problem_id,
+        "source_artifact": _relative(case_dir, artifact_dir),
+        "baseline_block_reason": source_summary.get("reason", source_summary.get("capability_review_note", "")),
+        "clarification_status": "questions_prepared",
+        "clarification_question_count": len(question_artifact.get("questions", [])),
+        "clarification_answer_count": 0,
+        "clarification_source": "",
+        "clarification_gate_status": "awaiting_answers",
+        "clarification_questions": _relative(_canonical_clarification_questions_path(case_dir), artifact_dir),
+        "generated_questions": _question_report_items(question_artifact),
+        "answer_provenance": [],
+        "classification": "not_run",
+        "verification_status": "not_run",
+        "spec_fidelity_status": "not_reviewed",
+    }
+
+
+def _clarification_row_from_solve(result: dict[str, Any], batch_artifact_dir: Path) -> dict[str, Any]:
+    source_artifact = str(result.get("source_artifact", result.get("clarified_from", "")))
+    row = {
+        "problem_id": result["problem_id"],
+        "source_artifact": source_artifact,
+        "baseline_block_reason": "",
+        "clarified_from": result.get("clarified_from", ""),
+        "clarification_status": result.get("clarification_status", ""),
+        "clarification_question_count": result.get("clarification_question_count", 0),
+        "clarification_answer_count": result.get("clarification_answer_count", 0),
+        "clarification_source": result.get("clarification_source", ""),
+        "clarification_gate_status": result.get("clarification_gate_status", ""),
+        "clarification_questions": result.get("clarification_questions", ""),
+        "clarification_answers": result.get("clarification_answers", ""),
+        "classification": result.get("classification", ""),
+        "verification_status": result.get("verification_status", ""),
+        "spec_fidelity_status": result.get("spec_fidelity_status", "not_reviewed"),
+        "spec_fidelity_gate_status": result.get("spec_fidelity_gate_status", ""),
+        "resolution_artifact": result.get("resolution_artifact", ""),
+    }
+    summary_path = batch_artifact_dir / str(result["problem_id"]) / "summary.json"
+    source_summary = _read_json_object(summary_path)
+    if source_summary:
+        row["baseline_block_reason"] = source_summary.get("reason", source_summary.get("capability_review_note", ""))
+    resolution_dir = Path(str(result.get("resolution_artifact", "")))
+    if resolution_dir.is_dir():
+        question_artifact = _read_json_object(_artifact_path(resolution_dir, result.get("clarification_questions"), "clarification/questions.json"))
+        answer_artifact = _read_json_object(_artifact_path(resolution_dir, result.get("clarification_answers"), "clarification/answers.json"))
+        row["generated_questions"] = _question_report_items(question_artifact)
+        row["answer_provenance"] = _answer_provenance_items(answer_artifact)
+    return row
+
+
+def _question_report_items(question_artifact: dict[str, Any]) -> list[dict[str, Any]]:
+    questions = question_artifact.get("questions") if isinstance(question_artifact, dict) else None
+    if not isinstance(questions, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        items.append(
+            {
+                "id": question.get("id", ""),
+                "issue_type": question.get("issue_type", ""),
+                "prompt": question.get("prompt", ""),
+                "source_evidence": question.get("source_evidence", ""),
+            }
+        )
+    return items
+
+
+def _answer_provenance_items(answer_artifact: dict[str, Any]) -> list[dict[str, Any]]:
+    answers = answer_artifact.get("answers") if isinstance(answer_artifact, dict) else None
+    if not isinstance(answers, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for answer in answers:
+        if not isinstance(answer, dict):
+            continue
+        items.append(
+            {
+                "question_id": answer.get("question_id", ""),
+                "reviewer": answer.get("reviewer", ""),
+                "source": answer.get("source", ""),
+                "rationale": answer.get("rationale", ""),
+            }
+        )
+    return items
+
+
 def _case_exit_code(case_dir: Path) -> int:
     summary = _read_json_object(case_dir / "summary.json")
     if summary.get("model_generation_status") == "generated" and summary.get("verification_status") == "PASS":
@@ -2323,6 +3422,102 @@ Start now. Complete the classification without asking for confirmation.
 """
 
 
+def _run_clarification_question_agent(
+    *,
+    problem_id: str,
+    statement: str,
+    capability: dict[str, Any],
+    artifact_dir: Path,
+    args: argparse.Namespace,
+) -> ClarificationAgentResult:
+    session_name = f"{problem_id}-clarification-questions"
+    session_dir = artifact_dir / "sessions" / session_name
+    events_path = session_dir / "codex-events.jsonl"
+    last_message_path = session_dir / "last-message.md"
+    work_dir = neutral_work_dir(artifact_dir, session_name)
+    for path in (artifact_dir, session_dir, work_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    last_message_path.unlink(missing_ok=True)
+
+    command = [
+        "codex",
+        "-a",
+        args.codex_approval,
+        "exec",
+        "--json",
+        "-C",
+        str(work_dir),
+        "--add-dir",
+        str(artifact_dir),
+        "--skip-git-repo-check",
+        "-s",
+        args.codex_sandbox,
+        "-o",
+        str(last_message_path),
+    ]
+    if args.codex_model:
+        command.extend(["-m", args.codex_model])
+    command.append("-")
+
+    timed_out = False
+    try:
+        result = subprocess.run(
+            command,
+            input=_build_clarification_question_agent_prompt(
+                problem_id=problem_id,
+                statement=statement,
+                capability=capability,
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=args.codex_timeout_seconds if args.codex_timeout_seconds and args.codex_timeout_seconds > 0 else None,
+        )
+        returncode = result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        returncode = 124
+        stdout = _coerce_timeout_stream(exc.stdout)
+        stderr = _coerce_timeout_stream(exc.stderr)
+        timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
+        stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
+
+    events_path.write_text(redact_text(stdout), encoding="utf-8")
+    if last_message_path.exists():
+        raw_text = last_message_path.read_text(encoding="utf-8")
+    else:
+        raw_text = stdout
+        last_message_path.write_text(raw_text, encoding="utf-8")
+    return ClarificationAgentResult(
+        raw_text=raw_text,
+        returncode=returncode,
+        timed_out=timed_out,
+        events_path=events_path,
+        last_message_path=last_message_path,
+        stderr=redact_text(stderr),
+    )
+
+
+def _build_clarification_question_agent_prompt(
+    *,
+    problem_id: str,
+    statement: str,
+    capability: dict[str, Any],
+) -> str:
+    return f"""{CLARIFICATION_SYSTEM_PROMPT}
+
+You are running as a nested Codex agent for OR-LLM-Agent `prepare-clarification`.
+Do not edit repository source files or artifact files. Return only the
+clarification question JSON object as your final answer.
+
+{build_clarification_question_prompt(problem_id, statement, capability)}
+
+Start now. Complete the question set without asking for confirmation.
+"""
+
+
 def _normalize_capability_payload(
     *,
     problem_id: str,
@@ -2423,6 +3618,7 @@ def _run_problem_spec_agent(
     previous_problem: dict[str, Any] | None = None,
     previous_response: str = "",
     repair_error: str = "",
+    clarification_context: dict[str, Any] | None = None,
 ) -> ProblemSpecAgentResult:
     session_name = f"{problem_id}-spec" if attempt == 1 else f"{problem_id}-spec-repair-{attempt - 1}"
     session_dir = artifact_dir / "sessions" / session_name
@@ -2462,6 +3658,7 @@ def _run_problem_spec_agent(
                 previous_problem=previous_problem,
                 previous_response=previous_response,
                 repair_error=repair_error,
+                clarification_context=clarification_context,
             ),
             capture_output=True,
             text=True,
@@ -2502,11 +3699,17 @@ def _build_problem_spec_agent_prompt(
     previous_problem: dict[str, Any] | None = None,
     previous_response: str = "",
     repair_error: str = "",
+    clarification_context: dict[str, Any] | None = None,
 ) -> str:
     repair_context = _build_problem_spec_repair_context(
         previous_problem=previous_problem,
         previous_response=previous_response,
         repair_error=repair_error,
+    )
+    prompt = (
+        build_clarified_problem_spec_prompt(problem_id, statement, clarification_context)
+        if clarification_context is not None
+        else build_problem_spec_prompt(problem_id, statement)
     )
     return f"""{PROBLEM_SPEC_SYSTEM_PROMPT}
 
@@ -2514,7 +3717,7 @@ You are running as a nested Codex agent for OR-LLM-Agent `spec --mode agent`.
 Do not edit repository source files. Return the generated problem metadata as
 your final answer.
 
-{build_problem_spec_prompt(problem_id, statement)}
+{prompt}
 {repair_context}
 
 Start now. Complete the workflow without asking for confirmation.
@@ -2599,10 +3802,16 @@ def _write_spec_fidelity_review(
     summary: dict[str, Any],
     statement: str,
     problem_path: Path,
+    clarification_context: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    fidelity = _build_spec_fidelity_payload(summary=summary, statement=statement, problem_path=problem_path)
+    fidelity = _build_spec_fidelity_payload(
+        summary=summary,
+        statement=statement,
+        problem_path=problem_path,
+        clarification_context=clarification_context,
+    )
     summary["spec_fidelity_gate_status"] = fidelity["gate_status"]
     summary["spec_fidelity_risk_flags"] = [flag["code"] for flag in fidelity["risk_flags"]]
     report_path.write_text(json.dumps(fidelity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2618,6 +3827,20 @@ def _write_spec_fidelity_review(
         f"- `{flag['severity']}` {flag['code']}: {flag['message']}"
         for flag in fidelity["risk_flags"]
     ] or ["- None detected by automatic checks."]
+    clarification_section = ""
+    if clarification_context is not None:
+        clarification_section = f"""
+
+## Clarification Context
+
+- Clarified from: `{summary.get('clarified_from', '')}`
+- Clarification status: `{summary.get('clarification_status', '')}`
+- Clarification gate: `{summary.get('clarification_gate_status', '')}`
+- Question artifact: `{summary.get('clarification_questions', '')}`
+- Answer artifact: `{summary.get('clarification_answers', '')}`
+- Question count: `{summary.get('clarification_question_count', 0)}`
+- Answer count: `{summary.get('clarification_answer_count', 0)}`
+"""
 
     path.write_text(
         f"""# ProblemSpec Fidelity Review
@@ -2650,6 +3873,7 @@ def _write_spec_fidelity_review(
 ## Risk Flags
 
 {chr(10).join(risk_lines)}
+{clarification_section}
 
 ## Manual Checklist
 
@@ -2659,6 +3883,7 @@ def _write_spec_fidelity_review(
 - [ ] Constraint families and bounds match the statement.
 - [ ] Metamorphic checks touch objective and constraint data paths, where available.
 - [ ] OR-CI result is interpreted as verification against the generated spec, not proof of original-statement correctness.
+- [ ] If clarification is present, the generated model matches the original statement plus approved clarification answers.
 
 ## Reviewer Note
 
@@ -2668,7 +3893,13 @@ TODO
     )
 
 
-def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, problem_path: Path) -> dict[str, Any]:
+def _build_spec_fidelity_payload(
+    *,
+    summary: dict[str, Any],
+    statement: str,
+    problem_path: Path,
+    clarification_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     problem = _read_json_object(problem_path)
     capability_status = str(summary.get("capability_status", "unknown"))
     if capability_status in CAPABILITY_BLOCKING_STATUSES:
@@ -2705,6 +3936,29 @@ def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, pro
                 ),
             }
         )
+    if clarification_context is not None:
+        automatic_checks.append(
+            {
+                "name": "clarification_gate",
+                "status": "PASS" if summary.get("clarification_gate_status") == "passed" else "FAIL",
+                "detail": (
+                    f"clarification_status={summary.get('clarification_status', '')}; "
+                    f"gate={summary.get('clarification_gate_status', '')}; "
+                    f"questions={summary.get('clarification_question_count', 0)}; "
+                    f"answers={summary.get('clarification_answer_count', 0)}"
+                ),
+            }
+        )
+    manual_checklist = [
+        "sets and indices match the statement",
+        "numeric parameters match the statement",
+        "objective direction and coefficients match the statement",
+        "constraint families and bounds match the statement",
+        "metamorphic paths touch objective and constraint data paths where available",
+        "OR-CI result is interpreted only against the generated spec",
+    ]
+    if clarification_context is not None:
+        manual_checklist.append("generated spec matches the original statement plus approved clarification answers")
     return {
         "problem_id": summary["problem_id"],
         "gate_status": gate_status,
@@ -2718,14 +3972,8 @@ def _build_spec_fidelity_payload(*, summary: dict[str, Any], statement: str, pro
         "classification": summary["classification"],
         "automatic_checks": automatic_checks,
         "risk_flags": [*_spec_fidelity_risk_flags(problem), *_capability_risk_flags(summary)],
-        "manual_checklist": [
-            "sets and indices match the statement",
-            "numeric parameters match the statement",
-            "objective direction and coefficients match the statement",
-            "constraint families and bounds match the statement",
-            "metamorphic paths touch objective and constraint data paths where available",
-            "OR-CI result is interpreted only against the generated spec",
-        ],
+        "manual_checklist": manual_checklist,
+        "clarification": clarification_context or {},
     }
 
 
@@ -2915,6 +4163,10 @@ def _relative(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def _portable_source_artifact(path: Path) -> str:
+    return _relative(path.resolve(), repo_root())
 
 
 if __name__ == "__main__":

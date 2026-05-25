@@ -27,6 +27,11 @@ uv run or-llm-agent pilot --mode api --ids <BWOR-ID>... --model <model> --artifa
 uv run or-llm-agent pilot --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--reuse-submissions]
 uv run or-llm-agent solve --mode agent --statement-file <problem.txt> --problem-id <ID> --artifact-dir <dir>
 uv run or-llm-agent solve-batch --mode agent --ids <BWOR-ID>... --artifact-dir <dir> [--statements-dir <dir>] [--dataset <bwor.jsonl>] [--agent-concurrency <N>]
+uv run or-llm-agent prepare-clarification --artifact-dir <case-dir> --out <questions.json>
+uv run or-llm-agent answer-clarification --artifact-dir <case-dir> --answers <answers.json> --reviewer <name>
+uv run or-llm-agent solve-clarified --artifact-dir <case-dir> --clarification <answers.json> --resolution-dir <dir>
+uv run or-llm-agent prepare-clarification-batch --artifact-dir <batch-dir> [--ids <BWOR-ID>...]
+uv run or-llm-agent solve-clarified-batch --artifact-dir <batch-dir> --clarifications-dir <dir> [--ids <BWOR-ID>...]
 uv run or-llm-agent review-fidelity --mode manual --artifact-dir <solve-dir> --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
 uv run or-llm-agent review-fidelity --mode agent --artifact-dir <solve-dir>
 uv run or-llm-agent review-fidelity-batch --mode manual --artifact-dir <batch-dir> [--ids <ID>...] --status accepted|rejected --reviewer <name> --note <text> [--evidence <text>]...
@@ -136,6 +141,39 @@ uv run or-ci validate-spec --problem <problem.json>
 - Concurrent `solve-batch` must write aggregate `summary.json` and `report.md`
   from the parent after all workers complete, preserving input ID order even
   when workers finish out of order.
+- `prepare-clarification` applies only to a single blocked solve artifact whose
+  `capability_status` is `needs_human`. It launches a nested Codex question
+  planner, writes the requested question artifact, and keeps a canonical copy at
+  `<case-dir>/clarification/questions.json` plus raw/events evidence under the
+  source artifact. Question artifacts use `problem_id`, `source_artifact`,
+  `blocking_status=needs_human`, and a non-empty `questions[]` list.
+- Supported clarification `issue_type` values are:
+  `missing_numeric_data`, `ambiguous_objective`, `unit_conflict`,
+  `domain_choice`, `timing_convention`, `data_conflict`, and
+  `modeling_convention`. Supported answer artifact `resolution_status` values
+  are `answered`, `partially_answered`, `rejected`, and `unresolved`.
+- `answer-clarification` validates an answer artifact against canonical
+  questions, stamps missing per-answer reviewer fields from `--reviewer`, and
+  writes the normalized canonical copy at
+  `<case-dir>/clarification/answers.json` without modifying an external
+  `--answers` file. If `--answers` already points at the canonical copy, it is
+  normalized in place. If required questions remain unanswered, the command
+  records `resolution_status=partially_answered` and returns nonzero.
+- `solve-clarified` does not overwrite the original blocked artifact and refuses
+  `--resolution-dir` values that resolve to the source `--artifact-dir`. It
+  requires answered required clarification questions, writes a separate
+  clarified solve artifact under `--resolution-dir`, passes the original
+  statement plus approved clarification answers to ProblemSpec generation and
+  model generation, marks generated metadata with top-level `source_context`,
+  reruns OR-CI, and writes fidelity review artifacts that include clarification
+  context.
+- Clarified solve summaries include `clarified_from`, `clarification_status`,
+  `clarification_question_count`, `clarification_answer_count`,
+  `clarification_source`, and `clarification_gate_status`.
+- `prepare-clarification-batch` and `solve-clarified-batch` default to only
+  `needs_human` rows from the source `solve-batch` summary when `--ids` is
+  omitted. They write `clarification-summary.json` and
+  `clarification-report.md` at the batch root.
 - Generated specs are run artifacts until reviewed. Do not treat a generated
   `problem.json` as benchmark ground truth.
 - Generated submissions must be extracted from fenced Python code blocks and
@@ -168,6 +206,12 @@ uv run or-ci validate-spec --problem <problem.json>
 | Nested Codex writes no submission | Write a stub submission, record `agent_failed`, and still produce raw/status artifacts. |
 | Capability classifier returns no JSON or invalid status | Record `capability_status=needs_human`, stop before ProblemSpec generation, and preserve raw/events artifacts. |
 | Capability classifier returns `needs_human` or `unsupported` | Write a complete blocked solve summary with `classification=blocked_capability`; do not generate a ProblemSpec. |
+| `prepare-clarification` source artifact is not `needs_human` | Return nonzero and do not create a clarification question artifact. |
+| Clarification question JSON is malformed | Return nonzero with a schema-specific error. |
+| Clarification answer JSON is malformed | Return nonzero with a schema-specific error. |
+| Required clarification question is unanswered | `answer-clarification` writes/keeps `partially_answered`; `solve-clarified` refuses to run ProblemSpec generation. |
+| Clarification artifact is `rejected` or `unresolved` | `solve-clarified` refuses to run ProblemSpec generation. |
+| Clarified solve is run | Write all new artifacts under the requested resolution directory; preserve the original blocked solve summary and classifier output. |
 | No fenced Python block | `generate` writes a stub submission, records `no_python_code`, and returns nonzero. |
 | Missing `def build_model` | `generate` writes the extracted code, records `generated_without_build_model`, and returns nonzero. |
 | Spec agent returns no JSON object | `spec` writes raw output, records `no_json`, writes a status JSON, and returns nonzero. |
@@ -202,6 +246,13 @@ uv run or-ci validate-spec --problem <problem.json>
   `summary.json`, and a `report.md` that lists spec validation, model
   generation, OR-CI classification, capability status, and fidelity gate status
   per case.
+- Good: `prepare-clarification` turns a `needs_human` blocked artifact into a
+  concise question artifact without changing the blocked `summary.json`.
+- Good: `solve-clarified` turns an answered clarification artifact into a
+  separate generated/verified run whose summary is traceable to the blocked
+  source artifact and clarification answers.
+- Good: `prepare-clarification-batch` only processes `needs_human` cases by
+  default and leaves `unsupported` cases alone.
 - Good: `review-fidelity-batch` transitions reviewed cases from
   `manual_review_required` to `accepted` or `rejected` and updates the aggregate
   batch report.
@@ -236,6 +287,10 @@ uv run or-ci validate-spec --problem <problem.json>
 - Run `uv run or-llm-agent classify-statement --help` after changing capability
   routing flags.
 - Run `uv run or-llm-agent solve-batch --help` after changing batch parser flags.
+- Run `uv run or-llm-agent prepare-clarification --help`,
+  `answer-clarification --help`, `solve-clarified --help`,
+  `prepare-clarification-batch --help`, and `solve-clarified-batch --help` after
+  changing clarification parser flags.
 - Run `uv run or-llm-agent review-fidelity --help` and
   `uv run or-llm-agent review-fidelity-batch --help` after changing review flags.
 - Run `uv run or-ci validate-spec --problem tests/fixtures/bwor/BWOR-001/problem.json`
@@ -247,6 +302,13 @@ uv run or-ci validate-spec --problem <problem.json>
   agent result.
 - Add tests that `solve` stops before ProblemSpec generation for
   `needs_human` and `unsupported` capability statuses.
+- Add tests that clarification question and answer schemas validate and reject
+  malformed artifacts.
+- Add tests that required unanswered clarification questions block
+  `solve-clarified`, and answered required questions allow a clarified solve
+  without overwriting the original blocked artifact.
+- Add tests that clarification batch preparation processes only `needs_human`
+  cases by default.
 - Add tests that `solve` stops before model generation when spec validation
   fails.
 - Add tests that `solve-batch` writes an aggregate summary/report from mocked
@@ -324,6 +386,14 @@ for problem_id in args.ids:
 This launches work before validating duplicate IDs and can race two workers into
 the same `<artifact-dir>/<problem-id>/` directory.
 
+```python
+if source_summary["capability_status"] == "needs_human":
+    solve_command(source_args)
+```
+
+This reruns the original blocked artifact and invites the agent to guess missing
+or ambiguous source facts.
+
 #### Correct
 
 ```python
@@ -335,3 +405,12 @@ run_cases_with_bounded_concurrency(cases, max_workers=args.agent_concurrency)
 Validate the full batch before launching case work, keep each case in its own
 artifact directory, and write aggregate summaries from the parent after all
 workers finish.
+
+```python
+if clarification_gate_status != "passed":
+    raise CLIError("clarification gate is not passed")
+solve_clarified_artifact(..., resolution_dir=separate_dir)
+```
+
+Clarified runs must require explicit answers, write to a separate resolution
+artifact, and keep the original capability block intact.
