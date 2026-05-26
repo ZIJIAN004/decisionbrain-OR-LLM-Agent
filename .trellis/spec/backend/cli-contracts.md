@@ -103,9 +103,39 @@ uv run or-ci validate-spec --problem <problem.json>
   `rejected`.
 - `review-fidelity --mode agent` launches a nested Codex reviewer for one
   `solve` artifact directory. The reviewer must return one JSON object with
-  `status=accepted|rejected`, `confidence`, `issues`, `review_note`, and
-  `evidence`. The parent CLI records the transition as `llm_accepted` or
-  `llm_rejected` to distinguish automated review from human certification.
+  `rubric_version=source_fidelity_v1`, `status=accepted|rejected`,
+  `confidence`, `dimensions`, `issues`, `review_note`, and `evidence`. The
+  parent CLI records the transition as `llm_accepted` or `llm_rejected` to
+  distinguish automated review from human certification.
+- Source-fidelity rubric dimensions are required for agent-mode review:
+  `source_suitability`, `data_completeness`, `sets_and_indices`,
+  `numeric_parameters`, `action_space`, `objective`, `units_and_scaling`,
+  `constraint_families`, `metamorphic_coverage`,
+  `clarification_dependency`, and `materiality`. Each dimension stores
+  `status=pass|warn|fail|not_applicable`,
+  `severity=none|minor|major|critical`, `finding`, `evidence[]`, and
+  `artifact_refs[]`.
+- Manual flat `review-fidelity` transitions remain supported for backward
+  compatibility. They are recorded with `rubric_version=legacy-flat` and
+  `spec_fidelity_rubric_complete=false`; batch capstone metrics must not count
+  them as rubric-complete cases.
+- `review-fidelity` summary updates include
+  `spec_fidelity_rubric_version`, `spec_fidelity_rubric_complete`,
+  `spec_fidelity_rubric_error`, `spec_fidelity_failed_dimensions`,
+  `spec_fidelity_warned_dimensions`,
+  `spec_fidelity_blocking_dimension_count`,
+  `spec_fidelity_warning_dimension_count`, `spec_fidelity_provisional`, and
+  `spec_fidelity_materiality`.
+- `review-fidelity` hard-block dimensions are `data_completeness`,
+  `action_space`, `objective`, `units_and_scaling`, and
+  `constraint_families`. If a review attempts acceptance while one of these
+  dimensions has `status=fail` and `severity=major|critical`, the parent CLI
+  must coerce the result to rejected and preserve the failed dimension in the
+  summary/report.
+- Agent-provided assumptions are not approved clarification. If
+  `clarification_source` indicates a provisional agent assumption, the review
+  must set `spec_fidelity_provisional=true` and warn on
+  `clarification_dependency`.
 - `review-fidelity` must not allow `accepted` or `llm_accepted` unless OR-CI
   metadata validation passed, parent OR-CI verification returned `PASS`, and the
   generated spec file exists. It may always record `rejected` or
@@ -114,6 +144,12 @@ uv run or-ci validate-spec --problem <problem.json>
   artifact root, then rewrites aggregate `summary.json` and `report.md`. In
   `--mode agent`, it runs one reviewer per case so each case has independent
   review evidence.
+- `review-fidelity-batch` also writes `fidelity-rubric-summary.json` and
+  `fidelity-rubric-report.md`. The summary JSON aggregates reviewed,
+  rubric-complete, legacy-flat, accepted, rejected, not-reviewed, provisional,
+  failed-dimension, and warned-dimension counts. The markdown report includes
+  the goal, claim boundary, aggregate metrics, case matrix, boundary taxonomy,
+  and capstone conclusion.
 - `resolve-fidelity --mode agent` is the automated post-rejection transition for
   one `solve` artifact directory. It uses the fidelity issue as ProblemSpec
   repair context, writes a repaired solve artifact under `--resolution-dir` or a
@@ -228,7 +264,10 @@ uv run or-ci validate-spec --problem <problem.json>
 | `review-fidelity --status accepted` for a failed or unverified case | Return nonzero and do not mark the artifact accepted. |
 | `review-fidelity --status rejected` for a failed or unverified case | Record the rejection and preserve failed generation/verification status. |
 | `review-fidelity --mode agent` reviewer returns no JSON or invalid status | Record `llm_rejected`, preserve agent events and final-message paths as evidence, and keep generated run status unchanged. |
+| `review-fidelity --mode agent` reviewer omits required rubric dimensions | Record `llm_rejected`, set `spec_fidelity_rubric_complete=false`, and include a rubric-incomplete note. |
+| `review-fidelity --mode agent` reviewer attempts acceptance with hard-block dimension failure | Coerce to `llm_rejected`, record the failed dimension, and update the source-statement fidelity automatic check to `FAIL`. |
 | `review-fidelity --mode agent` reviewer tries to accept a failed or unverified case | Record `llm_rejected` with a parent-gate note; do not mark the artifact accepted. |
+| Fidelity review depends on provisional agent clarification | Keep the case reviewable, set `spec_fidelity_provisional=true`, warn on `clarification_dependency`, and surface it in batch capstone output. |
 | `resolve-fidelity` source artifact is not rejected | Skip unless `--force` is set; record `skipped_not_rejected` if explicitly invoked. |
 | Repaired ProblemSpec does not validate or repaired solve fails | Record `repair_failed`; do not overwrite the source solve artifact. |
 | Repaired solve verifies but fidelity review still rejects | Run deterministic impact analysis and classify as `residual_harmless_equivalent`, `residual_material`, or `residual_unresolved`. |
@@ -272,6 +311,16 @@ uv run or-ci validate-spec --problem <problem.json>
 - Good: `review-fidelity-batch --mode agent` transitions reviewed cases from
   `manual_review_required` to `llm_accepted` or `llm_rejected`, preserving per
   case agent evidence in each case's `spec/fidelity-review.json`.
+- Good: rubric-complete `review-fidelity --mode agent` writes dimension
+  details to `spec/fidelity-review.json`, compact counters to `summary.json`,
+  and a dimension table to `spec/fidelity-review.md`.
+- Good: `review-fidelity-batch` writes `fidelity-rubric-summary.json` and
+  `fidelity-rubric-report.md`, then links those artifacts from `report.md`.
+- Base: manual flat `review-fidelity` is accepted or rejected for backward
+  compatibility but is marked `legacy-flat` and excluded from
+  rubric-complete aggregate counts.
+- Bad: an agent reviewer returns `accepted` without rubric dimensions; the
+  parent CLI records `llm_rejected` instead of silently upgrading the case.
 - Good: `resolve-fidelity` repairs a rejected source artifact into a new
   `repaired_accepted` artifact without mutating the original generated spec or
   submission.
@@ -306,6 +355,11 @@ uv run or-ci validate-spec --problem <problem.json>
   changing clarification parser flags.
 - Run `uv run or-llm-agent review-fidelity --help` and
   `uv run or-llm-agent review-fidelity-batch --help` after changing review flags.
+- Add tests that agent fidelity review accepts rubric-complete payloads, rejects
+  missing-dimension payloads, and coerces hard-block dimension failures to
+  rejected.
+- Add tests that batch fidelity review writes `fidelity-rubric-summary.json`,
+  `fidelity-rubric-report.md`, and `report.md` capstone links.
 - Run `uv run or-ci validate-spec --problem tests/fixtures/bwor/BWOR-001/problem.json`
   from the OR-CI repo, or `uv run python -m or_ci.cli validate-spec --problem ...`
   from this repo when the console script is unavailable.

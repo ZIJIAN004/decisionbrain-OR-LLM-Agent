@@ -1413,6 +1413,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(summary["spec_fidelity_review"], "spec/fidelity-review.md")
             self.assertEqual(summary["spec_fidelity_report"], "spec/fidelity-review.json")
             self.assertEqual(summary["spec_fidelity_gate_status"], "manual_review_required")
+            self.assertEqual(summary["spec_fidelity_rubric_version"], "source_fidelity_v1")
+            self.assertFalse(summary["spec_fidelity_rubric_complete"])
             review = (artifact_dir / "spec" / "fidelity-review.md").read_text(encoding="utf-8")
             self.assertIn("Model generation: `generated`", review)
             self.assertIn("Verification: `PASS`", review)
@@ -1420,7 +1422,26 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertIn("Fidelity gate: `manual_review_required`", review)
             report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
             self.assertEqual(report["gate_status"], "manual_review_required")
+            self.assertEqual(report["rubric_version"], "source_fidelity_v1")
             self.assertEqual(report["automatic_checks"][1]["status"], "PASS")
+
+    def test_source_fidelity_risk_flags_cover_feature_boundaries(self) -> None:
+        from or_llm_agent.cli import _spec_fidelity_risk_flags
+
+        multi_problem = _multi_scenario_problem()
+        del multi_problem["scenarios"][1]["objective"]
+        multi_flags = _spec_fidelity_risk_flags(multi_problem, {})
+        self.assertIn("multi_scenario_missing_objective_check", [flag["code"] for flag in multi_flags])
+
+        routing_problem = _valid_problem()
+        routing_problem["instance"] = {"distance": [1, 2, 3]}
+        routing_flags = _spec_fidelity_risk_flags(routing_problem, {"problem_family": "TSP routing"})
+        self.assertIn("routing_or_tsp_cost_scaling_only", [flag["code"] for flag in routing_flags])
+
+        miqp_problem = _valid_problem()
+        miqp_problem["problem_type"] = "MIQP"
+        miqp_flags = _spec_fidelity_risk_flags(miqp_problem, {})
+        self.assertIn("complex_unit_scaling_requires_review", [flag["code"] for flag in miqp_flags])
 
     def test_solve_batch_writes_aggregate_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1870,12 +1891,51 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(report["fidelity_status"], "accepted")
             self.assertEqual(report["gate_status"], "accepted")
             self.assertEqual(report["review"]["status"], "accepted")
+            self.assertEqual(report["rubric_version"], "legacy-flat")
+            self.assertFalse(summary["spec_fidelity_rubric_complete"])
             self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
             review = (artifact_dir / "spec" / "fidelity-review.md").read_text(encoding="utf-8")
             self.assertIn("## Review Decision", review)
             self.assertIn("Status: `accepted`", review)
 
     def test_review_fidelity_agent_accepts_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+
+            payload = {
+                "status": "accepted",
+                "confidence": 0.92,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(),
+                "issues": [],
+                "review_note": "Source statement and generated spec match.",
+                "evidence": ["objective and price field match"],
+            }
+            with patch(
+                "or_llm_agent.cli._run_fidelity_review_agent",
+                return_value=_review_agent_result(root, payload),
+            ):
+                exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "llm_accepted")
+            self.assertEqual(summary["spec_fidelity_gate_status"], "llm_accepted")
+            self.assertEqual(summary["spec_fidelity_review_mode"], "agent")
+            self.assertEqual(summary["spec_fidelity_confidence"], 0.92)
+            self.assertEqual(summary["spec_fidelity_issue_count"], 0)
+            self.assertEqual(summary["spec_fidelity_rubric_version"], "source_fidelity_v1")
+            self.assertTrue(summary["spec_fidelity_rubric_complete"])
+            self.assertEqual(summary["spec_fidelity_blocking_dimension_count"], 0)
+            report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["review"]["reviewer"], "codex-agent")
+            self.assertEqual(report["dimensions"]["objective"]["status"], "pass")
+            self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
+
+    def test_review_fidelity_agent_rejects_missing_rubric_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             statement_path = root / "problem.txt"
@@ -1897,14 +1957,80 @@ class ProblemSpecGenerationTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(summary["spec_fidelity_status"], "llm_accepted")
-            self.assertEqual(summary["spec_fidelity_gate_status"], "llm_accepted")
-            self.assertEqual(summary["spec_fidelity_review_mode"], "agent")
-            self.assertEqual(summary["spec_fidelity_confidence"], 0.92)
-            self.assertEqual(summary["spec_fidelity_issue_count"], 0)
+            self.assertEqual(summary["spec_fidelity_status"], "llm_rejected")
+            self.assertFalse(summary["spec_fidelity_rubric_complete"])
+            self.assertIn("incomplete source_fidelity_v1 rubric", summary["spec_fidelity_review_note"])
             report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
-            self.assertEqual(report["review"]["reviewer"], "codex-agent")
-            self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
+            self.assertEqual(report["automatic_checks"][2]["status"], "FAIL")
+
+    def test_review_fidelity_agent_hard_block_dimension_overrides_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+
+            payload = {
+                "status": "accepted",
+                "confidence": 0.8,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(
+                    objective=_rubric_dimension(
+                        status="fail",
+                        severity="critical",
+                        finding="Generated objective omits a source cost term.",
+                    )
+                ),
+                "issues": [],
+                "review_note": "Attempted acceptance should be blocked.",
+                "evidence": ["objective mismatch"],
+            }
+            with patch(
+                "or_llm_agent.cli._run_fidelity_review_agent",
+                return_value=_review_agent_result(root, payload),
+            ):
+                exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads((artifact_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "llm_rejected")
+            self.assertEqual(summary["spec_fidelity_failed_dimensions"], ["objective"])
+            self.assertEqual(summary["spec_fidelity_blocking_dimension_count"], 1)
+            self.assertEqual(summary["spec_fidelity_issue_count"], 1)
+
+    def test_review_fidelity_marks_provisional_clarification_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            statement_path = root / "problem.txt"
+            artifact_dir = root / "run"
+            _write_solved_case(root, statement_path, artifact_dir)
+            summary_path = artifact_dir / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["clarification_source"] = "provisional_agent_assumption"
+            summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+            payload = {
+                "status": "accepted",
+                "confidence": 0.9,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(),
+                "issues": [],
+                "review_note": "Accepted with provisional clarification warning.",
+                "evidence": ["reviewed generated clarification"],
+            }
+            with patch(
+                "or_llm_agent.cli._run_fidelity_review_agent",
+                return_value=_review_agent_result(root, payload),
+            ):
+                exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
+
+            self.assertEqual(exit_code, 0)
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["spec_fidelity_status"], "llm_accepted")
+            self.assertTrue(summary["spec_fidelity_provisional"])
+            self.assertIn("clarification_dependency", summary["spec_fidelity_warned_dimensions"])
+            review = (artifact_dir / "spec" / "fidelity-review.md").read_text(encoding="utf-8")
+            self.assertIn("Provisional: `True`", review)
 
     def test_review_fidelity_agent_rejects_no_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2041,6 +2167,12 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(batch["summary"]["spec_fidelity_gate_statuses"]["accepted"], 2)
             self.assertEqual(batch["rows"][0]["spec_fidelity_status"], "accepted")
             self.assertIn("accepted", (artifact_dir / "report.md").read_text(encoding="utf-8"))
+            self.assertTrue((artifact_dir / "fidelity-rubric-summary.json").exists())
+            self.assertTrue((artifact_dir / "fidelity-rubric-report.md").exists())
+            rubric = json.loads((artifact_dir / "fidelity-rubric-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(rubric["summary"]["legacy_flat_count"], 2)
+            self.assertIn("Source-Fidelity Capstone", (artifact_dir / "report.md").read_text(encoding="utf-8"))
+            self.assertIn("Claim Boundary", (artifact_dir / "fidelity-rubric-report.md").read_text(encoding="utf-8"))
 
     def test_review_fidelity_batch_with_ids_preserves_unreviewed_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2132,6 +2264,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             accepted_review = {
                 "status": "accepted",
                 "confidence": 0.91,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(),
                 "issues": [],
                 "review_note": "Repaired spec now matches the statement.",
                 "evidence": ["missing action restored"],
@@ -2188,6 +2322,14 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             rejected_review = {
                 "status": "rejected",
                 "confidence": 0.8,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(
+                    action_space=_rubric_dimension(
+                        status="warn",
+                        severity="minor",
+                        finding="Residual dominated action-space issue remains.",
+                    )
+                ),
                 "issues": [{"severity": "minor", "field": "action_space", "message": "still incomplete"}],
                 "review_note": "Residual action-space issue remains.",
                 "evidence": [],
@@ -2280,6 +2422,8 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             accepted_review = {
                 "status": "accepted",
                 "confidence": 0.9,
+                "rubric_version": "source_fidelity_v1",
+                "dimensions": _rubric_dimensions(),
                 "issues": [],
                 "review_note": "Resolved.",
                 "evidence": [],
@@ -2392,6 +2536,41 @@ def _clarification_answers(problem_id: str = "CASE-SYMBOLIC", reviewer: str = "u
         ],
         "resolution_status": "answered",
     }
+
+
+def _rubric_dimension(
+    *,
+    status: str = "pass",
+    severity: str = "none",
+    finding: str = "Source and generated spec are aligned for this dimension.",
+    evidence: list[str] | None = None,
+    artifact_refs: list[str] | None = None,
+) -> dict:
+    return {
+        "status": status,
+        "severity": severity,
+        "finding": finding,
+        "evidence": evidence if evidence is not None else ["unit-test evidence"],
+        "artifact_refs": artifact_refs if artifact_refs is not None else ["statement", "spec/problem.json"],
+    }
+
+
+def _rubric_dimensions(**overrides: dict) -> dict:
+    dimensions = {
+        "source_suitability": _rubric_dimension(),
+        "data_completeness": _rubric_dimension(),
+        "sets_and_indices": _rubric_dimension(),
+        "numeric_parameters": _rubric_dimension(),
+        "action_space": _rubric_dimension(),
+        "objective": _rubric_dimension(),
+        "units_and_scaling": _rubric_dimension(),
+        "constraint_families": _rubric_dimension(),
+        "metamorphic_coverage": _rubric_dimension(),
+        "clarification_dependency": _rubric_dimension(status="not_applicable", finding="No clarification dependency."),
+        "materiality": _rubric_dimension(finding="No material mismatch detected."),
+    }
+    dimensions.update(overrides)
+    return dimensions
 
 
 def _fake_generate_agent_submission(inputs, paths, args):

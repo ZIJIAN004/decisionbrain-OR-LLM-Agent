@@ -146,6 +146,31 @@ class ClarificationAnswer:
 
 FIDELITY_ACCEPTED_STATUSES = {"accepted", "llm_accepted"}
 FIDELITY_REJECTED_STATUSES = {"rejected", "llm_rejected"}
+SOURCE_FIDELITY_RUBRIC_VERSION = "source_fidelity_v1"
+LEGACY_SOURCE_FIDELITY_RUBRIC_VERSION = "legacy-flat"
+SOURCE_FIDELITY_DIMENSIONS = (
+    "source_suitability",
+    "data_completeness",
+    "sets_and_indices",
+    "numeric_parameters",
+    "action_space",
+    "objective",
+    "units_and_scaling",
+    "constraint_families",
+    "metamorphic_coverage",
+    "clarification_dependency",
+    "materiality",
+)
+SOURCE_FIDELITY_DIMENSION_STATUSES = {"pass", "warn", "fail", "not_applicable"}
+SOURCE_FIDELITY_SEVERITIES = {"none", "minor", "major", "critical"}
+SOURCE_FIDELITY_BLOCKING_SEVERITIES = {"major", "critical"}
+SOURCE_FIDELITY_HARD_BLOCK_DIMENSIONS = {
+    "data_completeness",
+    "action_space",
+    "objective",
+    "units_and_scaling",
+    "constraint_families",
+}
 CAPABILITY_STATUSES = {"supported", "needs_human", "unsupported"}
 CAPABILITY_BLOCKING_STATUSES = {"needs_human", "unsupported"}
 CLARIFICATION_ISSUE_TYPES = {
@@ -1087,6 +1112,12 @@ def review_fidelity_batch_command(args: argparse.Namespace) -> int:
     summary = summarize_solve_batch(rows)
     payload = {"summary": summary, "rows": rows}
     _write_summary(artifact_dir / "summary.json", payload)
+    rubric_summary = summarize_source_fidelity_rubric(rows)
+    _write_summary(
+        artifact_dir / "fidelity-rubric-summary.json",
+        {"summary": rubric_summary, "rows": _source_fidelity_rubric_rows(rows)},
+    )
+    write_fidelity_rubric_report(artifact_dir / "fidelity-rubric-report.md", rubric_summary, rows)
     report_args = argparse.Namespace(ids=aggregate_ids, mode="agent")
     write_solve_batch_report(artifact_dir / "report.md", report_args, summary, rows)
     print(f"reviewed {len(review_ids)} case(s); wrote {artifact_dir / 'report.md'}")
@@ -2479,6 +2510,98 @@ def summarize_solve_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_source_fidelity_rubric(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    gate_statuses: dict[str, int] = {}
+    rubric_versions: dict[str, int] = {}
+    dimension_failures: dict[str, int] = {}
+    dimension_warnings: dict[str, int] = {}
+    excluded: list[str] = []
+    reviewed_count = 0
+    rubric_complete_count = 0
+    legacy_flat_count = 0
+    provisional_count = 0
+    or_ci_verified_count = 0
+    for row in rows:
+        problem_id = str(row.get("problem_id", "unknown"))
+        status = str(row.get("spec_fidelity_status", "unknown"))
+        gate = str(row.get("spec_fidelity_gate_status", "unknown"))
+        version = str(row.get("spec_fidelity_rubric_version", "missing"))
+        statuses[status] = statuses.get(status, 0) + 1
+        gate_statuses[gate] = gate_statuses.get(gate, 0) + 1
+        rubric_versions[version] = rubric_versions.get(version, 0) + 1
+        if row.get("verification_status") == "PASS":
+            or_ci_verified_count += 1
+        if status not in {"not_reviewed", "unknown", "missing_summary"}:
+            reviewed_count += 1
+        if row.get("spec_fidelity_rubric_complete") is True:
+            rubric_complete_count += 1
+        if version == LEGACY_SOURCE_FIDELITY_RUBRIC_VERSION:
+            legacy_flat_count += 1
+        if row.get("spec_fidelity_provisional") is True:
+            provisional_count += 1
+        for dimension in _string_list(row.get("spec_fidelity_failed_dimensions")):
+            dimension_failures[dimension] = dimension_failures.get(dimension, 0) + 1
+        for dimension in _string_list(row.get("spec_fidelity_warned_dimensions")):
+            dimension_warnings[dimension] = dimension_warnings.get(dimension, 0) + 1
+        if status not in FIDELITY_ACCEPTED_STATUSES or row.get("spec_fidelity_provisional") is True or row.get("verification_status") != "PASS":
+            excluded.append(problem_id)
+
+    accepted_count = sum(statuses.get(status, 0) for status in FIDELITY_ACCEPTED_STATUSES)
+    rejected_count = sum(statuses.get(status, 0) for status in FIDELITY_REJECTED_STATUSES)
+    return {
+        "total": len(rows),
+        "or_ci_verified_count": or_ci_verified_count,
+        "reviewed_count": reviewed_count,
+        "rubric_complete_count": rubric_complete_count,
+        "legacy_flat_count": legacy_flat_count,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "not_reviewed_count": statuses.get("not_reviewed", 0),
+        "provisional_count": provisional_count,
+        "spec_fidelity_statuses": statuses,
+        "spec_fidelity_gate_statuses": gate_statuses,
+        "rubric_versions": rubric_versions,
+        "dimension_failures": dimension_failures,
+        "dimension_warnings": dimension_warnings,
+        "excluded_from_headline_claim": excluded,
+        "strongest_defensible_claim": _source_fidelity_claim_sentence(
+            accepted_count=accepted_count,
+            rejected_count=rejected_count,
+            provisional_count=provisional_count,
+        ),
+    }
+
+
+def _source_fidelity_claim_sentence(*, accepted_count: int, rejected_count: int, provisional_count: int) -> str:
+    return (
+        "Among OR-CI-verified generated models, source-fidelity review accepted "
+        f"{accepted_count} case(s), rejected {rejected_count} case(s), and marked "
+        f"{provisional_count} case(s) as provisional; use this as a layered "
+        "acceptance/false-accept exposure claim, not a raw solve-count claim."
+    )
+
+
+def _source_fidelity_rubric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "problem_id": row.get("problem_id", "unknown"),
+            "verification_status": row.get("verification_status", "unknown"),
+            "classification": row.get("classification", "unknown"),
+            "spec_fidelity_status": row.get("spec_fidelity_status", "unknown"),
+            "spec_fidelity_gate_status": row.get("spec_fidelity_gate_status", "unknown"),
+            "spec_fidelity_rubric_version": row.get("spec_fidelity_rubric_version", "missing"),
+            "spec_fidelity_rubric_complete": row.get("spec_fidelity_rubric_complete", False),
+            "spec_fidelity_failed_dimensions": _string_list(row.get("spec_fidelity_failed_dimensions")),
+            "spec_fidelity_warned_dimensions": _string_list(row.get("spec_fidelity_warned_dimensions")),
+            "spec_fidelity_provisional": bool(row.get("spec_fidelity_provisional")),
+            "spec_fidelity_materiality": row.get("spec_fidelity_materiality", ""),
+            "artifact_dir": row.get("artifact_dir", ""),
+        }
+        for row in rows
+    ]
+
+
 def summarize_clarification_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     gates: dict[str, int] = {}
@@ -2597,6 +2720,16 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
             f"`{row['artifact_dir']}` |"
         )
 
+    capstone_section = ""
+    if (path.parent / "fidelity-rubric-summary.json").is_file() or (path.parent / "fidelity-rubric-report.md").is_file():
+        capstone_section = """
+
+## Source-Fidelity Capstone
+
+- Machine summary: `fidelity-rubric-summary.json`
+- Report output: `fidelity-rubric-report.md`
+"""
+
     path.write_text(
         f"""# Statement-Only Solve Batch Report
 
@@ -2615,6 +2748,7 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
 ## Matrix
 
 {chr(10).join(matrix)}
+{capstone_section}
 
 ## Interpretation Notes
 
@@ -2631,6 +2765,87 @@ def write_solve_batch_report(path: Path, args: argparse.Namespace, summary: dict
 """,
         encoding="utf-8",
     )
+
+
+def write_fidelity_rubric_report(path: Path, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    matrix = [
+        "| Problem | OR-CI | Fidelity | Rubric | Failed Dimensions | Warned Dimensions | Provisional | Materiality | Artifact |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        failed = ", ".join(_string_list(row.get("spec_fidelity_failed_dimensions"))) or "-"
+        warned = ", ".join(_string_list(row.get("spec_fidelity_warned_dimensions"))) or "-"
+        matrix.append(
+            f"| {row.get('problem_id', 'unknown')} | `{row.get('verification_status', 'unknown')}` | "
+            f"`{row.get('spec_fidelity_status', 'unknown')}` | "
+            f"`{row.get('spec_fidelity_rubric_version', 'missing')}` | {failed} | {warned} | "
+            f"`{row.get('spec_fidelity_provisional', False)}` | "
+            f"`{row.get('spec_fidelity_materiality', '') or '-'}` | `{row.get('artifact_dir', '')}` |"
+        )
+
+    boundary_lines = _fidelity_boundary_taxonomy_lines(rows)
+    excluded = _string_list(summary.get("excluded_from_headline_claim"))
+    excluded_line = ", ".join(excluded) if excluded else "None."
+    path.write_text(
+        f"""# Source-Fidelity Rubric Capstone
+
+## Goal
+
+Review generated OR-CI `ProblemSpec` artifacts against their source problem statements so report claims separate generated-spec/code verification from source-statement fidelity.
+
+## Claim Boundary
+
+OR-CI `PASS` means the generated submission passed checks against the generated spec. It does not by itself certify that the generated spec preserved the original statement.
+
+## Aggregate Metrics
+
+```json
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+```
+
+## Case Matrix
+
+{chr(10).join(matrix)}
+
+## Boundary Taxonomy
+
+{chr(10).join(boundary_lines)}
+
+## Capstone Conclusion
+
+{summary.get('strongest_defensible_claim', '')}
+
+- Cases excluded from headline source-fidelity claims: {excluded_line}
+- Weakest evidence categories are dimensions with nonzero warnings or failures.
+- Recommended next action: inspect rejected, provisional, and legacy-flat cases before using this batch in a paper-facing claim.
+""",
+        encoding="utf-8",
+    )
+
+
+def _fidelity_boundary_taxonomy_lines(rows: list[dict[str, Any]]) -> list[str]:
+    categories = {
+        "source/data invalid": 0,
+        "unsupported modeling scope": 0,
+        "source mismatch": 0,
+        "verifier weakness": 0,
+        "provisional clarification": 0,
+    }
+    for row in rows:
+        failed = set(_string_list(row.get("spec_fidelity_failed_dimensions")))
+        warned = set(_string_list(row.get("spec_fidelity_warned_dimensions")))
+        dimensions = failed | warned
+        if "data_completeness" in dimensions:
+            categories["source/data invalid"] += 1
+        if "source_suitability" in dimensions:
+            categories["unsupported modeling scope"] += 1
+        if dimensions & {"sets_and_indices", "numeric_parameters", "action_space", "objective", "units_and_scaling", "constraint_families"}:
+            categories["source mismatch"] += 1
+        if "metamorphic_coverage" in dimensions:
+            categories["verifier weakness"] += 1
+        if row.get("spec_fidelity_provisional") is True or "clarification_dependency" in dimensions:
+            categories["provisional clarification"] += 1
+    return [f"- {name}: {count}" for name, count in categories.items()]
 
 
 def write_clarification_report(path: Path, summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
@@ -2801,6 +3016,15 @@ def _solve_batch_row(
         "spec_fidelity_review_mode",
         "spec_fidelity_confidence",
         "spec_fidelity_issue_count",
+        "spec_fidelity_rubric_version",
+        "spec_fidelity_rubric_complete",
+        "spec_fidelity_rubric_error",
+        "spec_fidelity_failed_dimensions",
+        "spec_fidelity_warned_dimensions",
+        "spec_fidelity_blocking_dimension_count",
+        "spec_fidelity_warning_dimension_count",
+        "spec_fidelity_provisional",
+        "spec_fidelity_materiality",
         "fidelity_resolution_status",
         "fidelity_resolution_artifact",
         "fidelity_resolution_report",
@@ -2830,6 +3054,7 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if not isinstance(summary, dict):
         raise CLIError(f"solve summary must be a JSON object: {summary_path}")
+    review = _normalize_fidelity_review(review, summary=summary)
     if review["status"] in FIDELITY_ACCEPTED_STATUSES:
         _ensure_acceptance_is_allowed(summary, artifact_dir)
 
@@ -2842,6 +3067,9 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
             "fidelity_status": review["status"],
             "gate_status": review["status"],
             "review": review,
+            "rubric_version": review.get("rubric_version", LEGACY_SOURCE_FIDELITY_RUBRIC_VERSION),
+            "rubric_complete": review.get("rubric_complete", False),
+            "dimensions": review.get("dimensions", {}),
         }
     )
     _update_source_fidelity_check(report, review)
@@ -2855,6 +3083,15 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
             "spec_fidelity_review_note": review["note"],
             "spec_fidelity_evidence": review["evidence"],
             "spec_fidelity_review_mode": review.get("mode", "manual"),
+            "spec_fidelity_rubric_version": review.get("rubric_version", LEGACY_SOURCE_FIDELITY_RUBRIC_VERSION),
+            "spec_fidelity_rubric_complete": review.get("rubric_complete", False),
+            "spec_fidelity_rubric_error": review.get("rubric_error", ""),
+            "spec_fidelity_failed_dimensions": _review_failed_dimensions(review),
+            "spec_fidelity_warned_dimensions": _review_warned_dimensions(review),
+            "spec_fidelity_blocking_dimension_count": len(_review_blocking_dimensions(review)),
+            "spec_fidelity_warning_dimension_count": len(_review_warned_dimensions(review)),
+            "spec_fidelity_provisional": _review_is_provisional(review, summary),
+            "spec_fidelity_materiality": _review_materiality(review),
         }
     )
     if "confidence" in review:
@@ -2902,6 +3139,8 @@ def _agent_review_payload(artifact_dir: Path, args: argparse.Namespace) -> dict[
     note = "fidelity reviewer did not return a JSON object; treating source-statement fidelity as rejected"
     confidence: float | int | None = None
     issues: list[Any] = []
+    dimensions: dict[str, dict[str, Any]] = {}
+    rubric_error = "missing dimensions"
     evidence: list[str] = [
         f"agent events: {_relative(result.events_path, artifact_dir)}",
         f"agent final message: {_relative(result.last_message_path, artifact_dir)}",
@@ -2935,6 +3174,12 @@ def _agent_review_payload(artifact_dir: Path, args: argparse.Namespace) -> dict[
         if isinstance(parsed_evidence, list):
             evidence.extend(_stringify_review_evidence(item) for item in parsed_evidence)
 
+        dimensions, dimension_errors = _normalize_source_fidelity_dimensions(parsed.get("dimensions"))
+        rubric_error = "; ".join(dimension_errors)
+        if dimension_errors:
+            status = "llm_rejected"
+            note = f"fidelity reviewer returned incomplete source_fidelity_v1 rubric: {rubric_error}; {note}"
+
     if result.timed_out:
         status = "llm_rejected"
         note = f"fidelity reviewer timed out; {note}"
@@ -2956,6 +3201,10 @@ def _agent_review_payload(artifact_dir: Path, args: argparse.Namespace) -> dict[
         "evidence": evidence,
         "reviewed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "issues": issues,
+        "rubric_version": SOURCE_FIDELITY_RUBRIC_VERSION,
+        "rubric_complete": not rubric_error,
+        "rubric_error": rubric_error,
+        "dimensions": dimensions,
         "agent_returncode": result.returncode,
         "agent_timed_out": result.timed_out,
         "agent_stderr": redact_text(result.stderr),
@@ -3060,8 +3309,22 @@ Do not edit repository source files or artifact files. Read the materials below 
 
 Required JSON shape:
 {{
+  "rubric_version": "source_fidelity_v1",
   "status": "accepted" | "rejected",
   "confidence": 0.0,
+  "dimensions": {{
+    "source_suitability": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "data_completeness": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "sets_and_indices": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "numeric_parameters": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "action_space": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "objective": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "units_and_scaling": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "constraint_families": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}},
+    "metamorphic_coverage": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "reports/report.json"]}},
+    "clarification_dependency": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["clarification/answers.json"]}},
+    "materiality": {{"status": "pass|warn|fail|not_applicable", "severity": "none|minor|major|critical", "finding": "one sentence", "evidence": ["source-backed observation"], "artifact_refs": ["statement", "spec/problem.json"]}}
+  }},
   "issues": [
     {{"severity": "critical|major|minor", "field": "field or concept", "message": "specific mismatch or risk"}}
   ],
@@ -3071,9 +3334,11 @@ Required JSON shape:
 
 Decision rules:
 - Accept only when the generated `instance`, objective sense and coefficients, constraint families and bounds, and metamorphic paths are faithful to the source statement.
-- If clarification artifacts are present, evaluate fidelity against the original statement plus approved clarification answers.
+- If clarification artifacts are present, evaluate fidelity against the original statement plus approved human/source-backed clarification answers.
+- Do not treat agent-generated assumptions as approved clarification. Mark `clarification_dependency` as `warn` or `fail` if assumptions supply objective, action-space, unit, or data facts.
 - OR-CI `PASS` proves only that the generated submission passed the generated spec. It does not prove that the spec matches the original statement.
-- Reject if a value, set, objective, constraint, or important metamorphic path is missing, ambiguous, invented, or materially changed.
+- Reject if a value, set, action, objective, constraint, unit/scaling convention, or important metamorphic path is missing, ambiguous, invented, or materially changed.
+- Reject if any hard-block dimension (`data_completeness`, `action_space`, `objective`, `units_and_scaling`, `constraint_families`) has `status=fail` and `severity=major` or `critical`.
 - Reject if the generated spec validation or model verification did not pass.
 - Keep the answer to one JSON object and no surrounding prose.
 
@@ -3129,6 +3394,148 @@ def _stringify_review_evidence(item: Any) -> str:
         return str(item)
 
 
+def _normalize_fidelity_review(review: dict[str, Any], *, summary: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(review)
+    dimensions, dimension_errors = _normalize_source_fidelity_dimensions(normalized.get("dimensions"))
+    if dimensions:
+        normalized["dimensions"] = dimensions
+        normalized["rubric_version"] = SOURCE_FIDELITY_RUBRIC_VERSION
+        normalized["rubric_complete"] = not dimension_errors
+        normalized["rubric_error"] = "; ".join(dimension_errors)
+    elif normalized.get("mode") == "agent":
+        normalized["dimensions"] = {}
+        normalized["rubric_version"] = SOURCE_FIDELITY_RUBRIC_VERSION
+        normalized["rubric_complete"] = False
+        normalized["rubric_error"] = normalized.get("rubric_error") or "missing dimensions"
+        if normalized.get("status") in FIDELITY_ACCEPTED_STATUSES:
+            normalized["status"] = "llm_rejected"
+            normalized["note"] = f"rubric incomplete: {normalized['rubric_error']}; {normalized.get('note', '')}"
+    else:
+        normalized["dimensions"] = {}
+        normalized["rubric_version"] = LEGACY_SOURCE_FIDELITY_RUBRIC_VERSION
+        normalized["rubric_complete"] = False
+        normalized["rubric_error"] = ""
+
+    blocking = _review_blocking_dimensions(normalized)
+    if normalized.get("status") in FIDELITY_ACCEPTED_STATUSES and blocking:
+        normalized["status"] = "llm_rejected" if normalized.get("status") == "llm_accepted" else "rejected"
+        issue = {
+            "severity": "critical",
+            "field": "source_fidelity_rubric",
+            "message": f"hard-block dimension failure: {', '.join(blocking)}",
+        }
+        issues = normalized.get("issues")
+        normalized["issues"] = [*(issues if isinstance(issues, list) else []), issue]
+        normalized["note"] = f"rubric hard-block dimension failure ({', '.join(blocking)}); {normalized.get('note', '')}"
+
+    if _summary_has_provisional_clarification(summary) and normalized.get("dimensions"):
+        clarification = normalized["dimensions"].get("clarification_dependency")
+        if isinstance(clarification, dict) and clarification.get("status") in {"pass", "not_applicable"}:
+            clarification["status"] = "warn"
+            clarification["severity"] = "major"
+            clarification["finding"] = "Clarification source is provisional and cannot count as human/source-backed evidence."
+            clarification.setdefault("evidence", []).append(f"clarification_source={summary.get('clarification_source', '')}")
+    return normalized
+
+
+def _normalize_source_fidelity_dimensions(value: Any) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if not isinstance(value, dict):
+        return {}, ["dimensions must be a JSON object"]
+    normalized: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for name in SOURCE_FIDELITY_DIMENSIONS:
+        raw = value.get(name)
+        if not isinstance(raw, dict):
+            errors.append(f"{name} is missing or not an object")
+            continue
+        status = str(raw.get("status", "")).strip().lower()
+        severity = str(raw.get("severity", "")).strip().lower()
+        if status not in SOURCE_FIDELITY_DIMENSION_STATUSES:
+            errors.append(f"{name}.status must be one of {sorted(SOURCE_FIDELITY_DIMENSION_STATUSES)}")
+            status = "fail"
+        if severity not in SOURCE_FIDELITY_SEVERITIES:
+            errors.append(f"{name}.severity must be one of {sorted(SOURCE_FIDELITY_SEVERITIES)}")
+            severity = "critical" if status == "fail" else "minor"
+        normalized[name] = {
+            "status": status,
+            "severity": severity,
+            "finding": str(raw.get("finding", "")).strip(),
+            "evidence": [_stringify_review_evidence(item) for item in raw.get("evidence", [])]
+            if isinstance(raw.get("evidence"), list)
+            else [],
+            "artifact_refs": [_stringify_review_evidence(item) for item in raw.get("artifact_refs", [])]
+            if isinstance(raw.get("artifact_refs"), list)
+            else [],
+        }
+    return normalized, errors
+
+
+def _review_failed_dimensions(review: dict[str, Any]) -> list[str]:
+    return [
+        name
+        for name, dimension in _review_dimensions(review).items()
+        if dimension.get("status") == "fail"
+    ]
+
+
+def _review_warned_dimensions(review: dict[str, Any]) -> list[str]:
+    warned: list[str] = []
+    for name, dimension in _review_dimensions(review).items():
+        status = dimension.get("status")
+        severity = dimension.get("severity")
+        if status == "warn" or (status == "fail" and name not in _review_blocking_dimensions(review)):
+            warned.append(name)
+        elif status == "pass" and severity in {"minor", "major", "critical"}:
+            warned.append(name)
+    return warned
+
+
+def _review_blocking_dimensions(review: dict[str, Any]) -> list[str]:
+    return [
+        name
+        for name, dimension in _review_dimensions(review).items()
+        if name in SOURCE_FIDELITY_HARD_BLOCK_DIMENSIONS
+        and dimension.get("status") == "fail"
+        and dimension.get("severity") in SOURCE_FIDELITY_BLOCKING_SEVERITIES
+    ]
+
+
+def _review_dimensions(review: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    dimensions = review.get("dimensions")
+    return dimensions if isinstance(dimensions, dict) else {}
+
+
+def _review_materiality(review: dict[str, Any]) -> str:
+    dimension = _review_dimensions(review).get("materiality")
+    if not isinstance(dimension, dict):
+        return ""
+    status = str(dimension.get("status", "")).strip()
+    severity = str(dimension.get("severity", "")).strip()
+    if status and severity:
+        return f"{status}/{severity}"
+    return status or severity
+
+
+def _review_is_provisional(review: dict[str, Any], summary: dict[str, Any]) -> bool:
+    if review.get("provisional") is True or _summary_has_provisional_clarification(summary):
+        return True
+    dimension = _review_dimensions(review).get("clarification_dependency")
+    if not isinstance(dimension, dict):
+        return False
+    text = " ".join(
+        [
+            str(dimension.get("finding", "")),
+            *[str(item) for item in dimension.get("evidence", []) if isinstance(item, str)],
+        ]
+    ).lower()
+    return dimension.get("status") in {"warn", "fail"} and ("provisional" in text or "agent" in text or "assumption" in text)
+
+
+def _summary_has_provisional_clarification(summary: dict[str, Any]) -> bool:
+    source = str(summary.get("clarification_source", "")).lower()
+    return "provisional" in source or "assumption" in source or "agent" in source
+
+
 def _ensure_acceptance_is_allowed(summary: dict[str, Any], artifact_dir: Path) -> None:
     block_reason = _acceptance_block_reason(summary, artifact_dir)
     if block_reason:
@@ -3152,6 +3559,9 @@ def _update_source_fidelity_check(report: dict[str, Any], review: dict[str, Any]
         checks = []
     status = "PASS" if review["status"] in FIDELITY_ACCEPTED_STATUSES else "FAIL"
     detail = f"{review.get('mode', 'manual')} review {review['status']}: {review['note']}"
+    failed_dimensions = _review_failed_dimensions(review)
+    if failed_dimensions:
+        detail = f"{detail}; failed_dimensions={', '.join(failed_dimensions)}"
     for check in checks:
         if isinstance(check, dict) and check.get("name") == "source_statement_fidelity":
             check["status"] = status
@@ -3188,6 +3598,7 @@ def _write_reviewed_fidelity_markdown(
     ] or ["- None detected by automatic checks."]
     review = report.get("review") if isinstance(report.get("review"), dict) else {}
     evidence_lines = [f"- {item}" for item in review.get("evidence", [])] or ["- None recorded."]
+    rubric_table = _rubric_markdown_table(review.get("dimensions"))
 
     path.write_text(
         f"""# ProblemSpec Fidelity Review
@@ -3205,6 +3616,12 @@ def _write_reviewed_fidelity_markdown(
 - Classification: `{summary.get('classification', '')}`
 - Fidelity status: `{summary.get('spec_fidelity_status', '')}`
 - Fidelity gate: `{summary.get('spec_fidelity_gate_status', '')}`
+- Rubric version: `{summary.get('spec_fidelity_rubric_version', '')}`
+- Rubric complete: `{summary.get('spec_fidelity_rubric_complete', False)}`
+- Provisional: `{summary.get('spec_fidelity_provisional', False)}`
+- Failed dimensions: `{", ".join(_string_list(summary.get('spec_fidelity_failed_dimensions'))) or "-"}`
+- Warned dimensions: `{", ".join(_string_list(summary.get('spec_fidelity_warned_dimensions'))) or "-"}`
+- Materiality: `{summary.get('spec_fidelity_materiality', '') or "-"}`
 - Structured report: `{summary.get('spec_fidelity_report', '')}`
 
 ## Review Decision
@@ -3217,6 +3634,10 @@ def _write_reviewed_fidelity_markdown(
 ## Evidence
 
 {chr(10).join(evidence_lines)}
+
+## Rubric Dimensions
+
+{rubric_table}
 
 ## Statement Excerpt
 
@@ -3234,6 +3655,25 @@ def _write_reviewed_fidelity_markdown(
 """,
         encoding="utf-8",
     )
+
+
+def _rubric_markdown_table(dimensions: Any) -> str:
+    if not isinstance(dimensions, dict) or not dimensions:
+        return "No structured rubric dimensions recorded."
+    lines = [
+        "| Dimension | Status | Severity | Finding | Evidence |",
+        "|---|---|---|---|---|",
+    ]
+    for name in SOURCE_FIDELITY_DIMENSIONS:
+        dimension = dimensions.get(name)
+        if not isinstance(dimension, dict):
+            continue
+        evidence = "; ".join(_string_list(dimension.get("evidence"))) or "-"
+        lines.append(
+            f"| `{name}` | `{dimension.get('status', '')}` | `{dimension.get('severity', '')}` | "
+            f"{str(dimension.get('finding', '')).replace('|', '/')} | {evidence.replace('|', '/')} |"
+        )
+    return "\n".join(lines)
 
 
 def _artifact_path(artifact_dir: Path, value: Any, fallback: str) -> Path:
@@ -3936,6 +4376,15 @@ def _write_spec_fidelity_review(
     )
     summary["spec_fidelity_gate_status"] = fidelity["gate_status"]
     summary["spec_fidelity_risk_flags"] = [flag["code"] for flag in fidelity["risk_flags"]]
+    summary["spec_fidelity_rubric_version"] = SOURCE_FIDELITY_RUBRIC_VERSION
+    summary["spec_fidelity_rubric_complete"] = False
+    summary["spec_fidelity_rubric_error"] = "not_reviewed"
+    summary["spec_fidelity_failed_dimensions"] = []
+    summary["spec_fidelity_warned_dimensions"] = []
+    summary["spec_fidelity_blocking_dimension_count"] = 0
+    summary["spec_fidelity_warning_dimension_count"] = 0
+    summary["spec_fidelity_provisional"] = _summary_has_provisional_clarification(summary)
+    summary["spec_fidelity_materiality"] = ""
     report_path.write_text(json.dumps(fidelity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     statement_excerpt = statement.replace("\r\n", "\n").strip()
@@ -4093,7 +4542,9 @@ def _build_spec_fidelity_payload(
         "verification_status": summary["verification_status"],
         "classification": summary["classification"],
         "automatic_checks": automatic_checks,
-        "risk_flags": [*_spec_fidelity_risk_flags(problem), *_capability_risk_flags(summary)],
+        "rubric_version": SOURCE_FIDELITY_RUBRIC_VERSION,
+        "required_dimensions": list(SOURCE_FIDELITY_DIMENSIONS),
+        "risk_flags": [*_spec_fidelity_risk_flags(problem, summary), *_capability_risk_flags(summary)],
         "manual_checklist": manual_checklist,
         "clarification": clarification_context or {},
     }
@@ -4117,12 +4568,19 @@ def _fidelity_check_status(verification_status: Any) -> str:
     return "FAIL"
 
 
-def _spec_fidelity_risk_flags(problem: dict[str, Any]) -> list[dict[str, str]]:
+def _spec_fidelity_risk_flags(problem: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, str]]:
     instance = problem.get("instance") if isinstance(problem.get("instance"), dict) else {}
     metamorphic = problem.get("metamorphic") if isinstance(problem.get("metamorphic"), dict) else {}
     cost_scaling = metamorphic.get("cost_scaling") if isinstance(metamorphic.get("cost_scaling"), dict) else {}
     coefficient_paths = cost_scaling.get("coefficient_paths") if isinstance(cost_scaling.get("coefficient_paths"), list) else []
-    searchable = " ".join([*(_flatten_keys(instance)), *(str(path) for path in coefficient_paths)]).lower()
+    searchable = " ".join(
+        [
+            str(problem.get("problem_type", "")),
+            str(summary.get("problem_family", "")),
+            *(_flatten_keys(instance)),
+            *(str(path) for path in coefficient_paths),
+        ]
+    ).lower()
     flags: list[dict[str, str]] = []
     has_profit = "profit" in searchable or "revenue" in searchable
     has_cost = "cost" in searchable or "price" in searchable
@@ -4143,6 +4601,48 @@ def _spec_fidelity_risk_flags(problem: dict[str, Any]) -> list[dict[str, str]]:
                 "message": "metadata has no configured constraint relaxation check",
             }
         )
+    if _summary_has_provisional_clarification(summary):
+        flags.append(
+            {
+                "code": "provisional_clarification_dependency",
+                "severity": "warning",
+                "message": f"clarification_source={summary.get('clarification_source', '')} is not human/source-backed evidence",
+            }
+        )
+    if str(problem.get("problem_type", "")).upper() == "MULTI_SCENARIO":
+        missing_objective = [
+            str(scenario.get("name", index))
+            for index, scenario in enumerate(problem.get("scenarios", []))
+            if isinstance(scenario, dict)
+            and scenario.get("expected_solver_status", "OPTIMAL") == "OPTIMAL"
+            and ("objective" not in scenario or "metamorphic" not in scenario)
+        ]
+        if missing_objective:
+            flags.append(
+                {
+                    "code": "multi_scenario_missing_objective_check",
+                    "severity": "warning",
+                    "message": f"scenario(s) need source-fidelity objective review: {', '.join(missing_objective)}",
+                }
+            )
+    if any(token in searchable for token in ("tsp", "routing", "route", "distance", "travel")) and "constraint_relaxation" not in metamorphic:
+        flags.append(
+            {
+                "code": "routing_or_tsp_cost_scaling_only",
+                "severity": "warning",
+                "message": "routing/TSP-like metadata relies on cost scaling without an additional structural invariant",
+            }
+        )
+    if str(problem.get("problem_type", "")).upper() in {"QP", "MIQP"} or any(
+        token in searchable for token in ("quadratic", "pairwise")
+    ):
+        flags.append(
+            {
+                "code": "complex_unit_scaling_requires_review",
+                "severity": "warning",
+                "message": "quadratic or pairwise objective terms require explicit unit/scaling fidelity review",
+            }
+        )
     return flags
 
 
@@ -4154,7 +4654,9 @@ def _capability_risk_flags(summary: dict[str, Any]) -> list[dict[str, str]]:
     for feature in _string_list(summary.get("capability_unsupported_features")):
         flags.append(
             {
-                "code": "unsupported_feature",
+                "code": "unsupported_stochastic_policy"
+                if any(token in feature.lower() for token in ("stochastic", "dynamic", "policy", "robust"))
+                else "unsupported_feature",
                 "severity": "critical" if status == "unsupported" else "warning",
                 "message": feature,
             }
@@ -4162,7 +4664,9 @@ def _capability_risk_flags(summary: dict[str, Any]) -> list[dict[str, str]]:
     for item in _string_list(summary.get("capability_missing_information")):
         flags.append(
             {
-                "code": "missing_or_ambiguous_information",
+                "code": "dataset_missing_numeric_objective"
+                if any(token in item.lower() for token in ("numeric", "cost", "coefficient", "objective"))
+                else "missing_or_ambiguous_information",
                 "severity": "warning",
                 "message": item,
             }
