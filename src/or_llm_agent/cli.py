@@ -1651,6 +1651,7 @@ def generate_agent_submission(
             "agent_returncode": result.returncode,
             "agent_timed_out": result.timed_out,
             "agent_status": paths.status_path,
+            "agent_manifest": paths.manifest_path,
             "last_message": paths.last_message_path,
             "codex_events": paths.events_path,
         }
@@ -2424,6 +2425,9 @@ def build_pilot_row(
         "report": _relative(report_path, artifact_dir),
         "agent_returncode": generation.get("agent_returncode"),
         "agent_timed_out": generation.get("agent_timed_out"),
+        "agent_manifest": _relative(generation["agent_manifest"], artifact_dir)
+        if isinstance(generation.get("agent_manifest"), Path)
+        else "",
         "verify_returncode": verification.returncode,
         "verify_stdout": verification.stdout,
         "verify_stderr": verification.stderr,

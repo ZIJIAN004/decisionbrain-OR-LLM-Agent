@@ -38,6 +38,10 @@ class CodexAgentModeTests(unittest.TestCase):
             self.assertNotEqual(paths.work_dir, paths.artifact_root)
             self.assertFalse(paths.work_dir.is_relative_to(paths.artifact_root))
             self.assertIn("codex-work", str(paths.work_dir))
+            self.assertEqual(
+                paths.manifest_path,
+                paths.artifact_root / "agent-status" / "BWOR-001.agent-run-manifest.json",
+            )
             self.assertEqual(command[-1], "-")
 
     def test_prompt_documents_fallback_artifact_contract(self) -> None:
@@ -190,18 +194,41 @@ class CodexAgentModeTests(unittest.TestCase):
             self.assertTrue(paths.report_path.is_file())
             self.assertTrue(paths.status_path.is_file())
             self.assertTrue(paths.last_message_path.is_file())
+            self.assertTrue(paths.manifest_path.is_file())
             self.assertIn("def build_model", paths.submission_path.read_text(encoding="utf-8"))
 
             status = json.loads(paths.status_path.read_text(encoding="utf-8"))
             self.assertEqual(status["final_classification"], "SUCCESS")
             self.assertEqual(status["generation_mode"], "agent")
             self.assertEqual(status["work_dir"], str(paths.work_dir))
+            self.assertEqual(status["agent_manifest"], str(paths.manifest_path))
 
             raw = json.loads(paths.raw_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["returncode"], 0)
             self.assertEqual(raw["work_dir"], str(paths.work_dir))
+            self.assertEqual(raw["manifest_path"], str(paths.manifest_path))
             self.assertEqual(
                 set(raw["harvested_artifacts"]),
+                {
+                    str(paths.submission_path),
+                    str(paths.report_path),
+                    str(paths.status_path),
+                    str(paths.last_message_path),
+                },
+            )
+
+            manifest = json.loads(paths.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], "swe_agent_run_manifest_v1")
+            self.assertEqual(manifest["adapter"], "codex-cli")
+            self.assertEqual(manifest["problem_id"], "BWOR-001")
+            self.assertEqual(manifest["command"], result.command)
+            self.assertEqual(manifest["options"]["codex_sandbox"], "workspace-write")
+            self.assertEqual(manifest["paths"]["work_dir"], str(paths.work_dir))
+            self.assertEqual(manifest["outputs"]["submission_path"], str(paths.submission_path))
+            self.assertEqual(manifest["result"]["returncode"], 0)
+            self.assertFalse(manifest["result"]["timed_out"])
+            self.assertEqual(
+                set(manifest["harvested_artifacts"]),
                 {
                     str(paths.submission_path),
                     str(paths.report_path),
@@ -223,6 +250,7 @@ def _paths(root: Path, problem_id: str) -> CodexAgentPaths:
         report_path=artifact_root / "reports" / f"{problem_id}.json",
         raw_path=artifact_root / "raw" / f"{problem_id}.txt",
         status_path=artifact_root / "agent-status" / f"{problem_id}.json",
+        manifest_path=artifact_root / "agent-status" / f"{problem_id}.agent-run-manifest.json",
     )
 
 

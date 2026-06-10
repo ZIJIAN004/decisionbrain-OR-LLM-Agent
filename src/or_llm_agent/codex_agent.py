@@ -23,6 +23,7 @@ class CodexAgentPaths:
     report_path: Path
     raw_path: Path
     status_path: Path
+    manifest_path: Path
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ def build_agent_paths(
         report_path=(report_path or root / "reports" / f"{problem_id}.json").resolve(),
         raw_path=(raw_path or root / "raw" / f"{problem_id}.txt").resolve(),
         status_path=(root / "agent-status" / f"{problem_id}.json").resolve(),
+        manifest_path=(root / "agent-status" / f"{problem_id}.agent-run-manifest.json").resolve(),
     )
 
 
@@ -114,12 +116,24 @@ def run_codex_agent(
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
     harvested = _harvest_work_dir_artifacts(paths)
+    manifest_payload = _build_run_manifest(
+        problem_id=problem_id,
+        problem_path=problem_path,
+        paths=paths,
+        options=options,
+        command=command,
+        returncode=returncode,
+        timed_out=timed_out,
+        harvested_artifacts=harvested,
+    )
+    paths.manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     paths.events_path.write_text(redact_text(stdout), encoding="utf-8")
     raw_payload = {
         "problem_id": problem_id,
         "command": command,
         "returncode": returncode,
         "timed_out": timed_out,
+        "manifest_path": str(paths.manifest_path),
         "events_path": str(paths.events_path),
         "last_message_path": str(paths.last_message_path),
         "work_dir": str(paths.work_dir),
@@ -145,6 +159,7 @@ def run_codex_agent(
             "last_message_path": str(paths.last_message_path),
             "work_dir": str(paths.work_dir),
             "status_path": str(paths.status_path),
+            "agent_manifest": str(paths.manifest_path),
         }
     )
     paths.status_path.write_text(json.dumps(status_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -169,6 +184,52 @@ def _read_existing_status(path: Path) -> dict[str, Any]:
     if isinstance(existing, dict):
         return existing
     return {"nested_status": existing}
+
+
+def _build_run_manifest(
+    *,
+    problem_id: str,
+    problem_path: Path,
+    paths: CodexAgentPaths,
+    options: CodexAgentOptions,
+    command: list[str],
+    returncode: int,
+    timed_out: bool,
+    harvested_artifacts: list[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "swe_agent_run_manifest_v1",
+        "adapter": "codex-cli",
+        "problem_id": problem_id,
+        "command": command,
+        "options": {
+            "codex_model": options.codex_model,
+            "codex_sandbox": options.codex_sandbox,
+            "codex_approval": options.codex_approval,
+            "max_repair_attempts": options.max_repair_attempts,
+            "timeout_seconds": options.timeout_seconds,
+        },
+        "paths": {
+            "artifact_root": str(paths.artifact_root),
+            "work_dir": str(paths.work_dir),
+            "session_dir": str(paths.session_dir),
+            "problem_path": str(problem_path),
+        },
+        "outputs": {
+            "submission_path": str(paths.submission_path),
+            "report_path": str(paths.report_path),
+            "raw_path": str(paths.raw_path),
+            "status_path": str(paths.status_path),
+            "events_path": str(paths.events_path),
+            "last_message_path": str(paths.last_message_path),
+            "manifest_path": str(paths.manifest_path),
+        },
+        "result": {
+            "returncode": returncode,
+            "timed_out": timed_out,
+        },
+        "harvested_artifacts": harvested_artifacts,
+    }
 
 
 def build_codex_command(paths: CodexAgentPaths, options: CodexAgentOptions) -> list[str]:
@@ -335,6 +396,7 @@ def _ensure_agent_dirs(paths: CodexAgentPaths) -> None:
         paths.report_path.parent,
         paths.raw_path.parent,
         paths.status_path.parent,
+        paths.manifest_path.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
