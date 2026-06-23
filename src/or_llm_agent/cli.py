@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,7 +24,16 @@ from or_llm_agent.bwor import (
     repo_root,
 )
 from or_llm_agent.code_blocks import extract_python_module, has_build_model_contract
-from or_llm_agent.codex_agent import CodexAgentOptions, CodexAgentPaths, build_agent_paths, neutral_work_dir, run_codex_agent
+from or_llm_agent.codex_agent import (
+    CodexAgentOptions,
+    CodexAgentPaths,
+    build_agent_paths,
+    build_codex_run_metadata,
+    codex_exec_model_args,
+    codex_run_metadata_summary_fields,
+    neutral_work_dir,
+    run_codex_agent,
+)
 from or_llm_agent.json_blocks import extract_json_object
 from or_llm_agent.or_ci import SpecValidationResult, VerificationResult, or_ci_command, run_or_ci_validate_spec, run_or_ci_verify
 from or_llm_agent.prompts import (
@@ -62,6 +71,7 @@ class ProblemSpecAgentResult:
     events_path: Path
     last_message_path: Path
     stderr: str
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,7 @@ class FidelityReviewAgentResult:
     events_path: Path
     last_message_path: Path
     stderr: str
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,7 @@ class CapabilityAgentResult:
     events_path: Path
     last_message_path: Path
     stderr: str
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -122,6 +134,7 @@ class ClarificationAgentResult:
     events_path: Path
     last_message_path: Path
     stderr: str
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -421,10 +434,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_agent_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-model", help="agent mode: model for nested codex exec")
+    parser.add_argument("--codex-reasoning-effort", help="agent mode: pass model_reasoning_effort to nested codex exec")
     parser.add_argument("--codex-sandbox", default="workspace-write", choices=("read-only", "workspace-write", "danger-full-access"))
     parser.add_argument("--codex-approval", default="never", choices=("untrusted", "on-failure", "on-request", "never"))
     parser.add_argument("--max-repair-attempts", default=3, type=int)
     parser.add_argument("--codex-timeout-seconds", default=900, type=int, help="agent mode: timeout for one nested codex exec run; <=0 disables")
+
+
+def _codex_options_from_args(args: argparse.Namespace) -> CodexAgentOptions:
+    return CodexAgentOptions(
+        codex_model=args.codex_model,
+        codex_sandbox=args.codex_sandbox,
+        codex_approval=args.codex_approval,
+        max_repair_attempts=args.max_repair_attempts,
+        timeout_seconds=args.codex_timeout_seconds,
+        codex_reasoning_effort=args.codex_reasoning_effort,
+    )
 
 
 def health_command(args: argparse.Namespace) -> int:
@@ -712,6 +737,7 @@ def solve_command(args: argparse.Namespace) -> int:
             "spec_validation_returncode": spec_result.get("validation_returncode"),
             "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
             "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+            **codex_run_metadata_summary_fields(spec_result.get("codex_run_metadata"), prefix="spec"),
         }
     )
 
@@ -767,6 +793,7 @@ def solve_command(args: argparse.Namespace) -> int:
             "verify_returncode": verification.returncode,
             "verify_stdout": verification.stdout,
             "verify_stderr": verification.stderr,
+            **codex_run_metadata_summary_fields(generation.get("codex_run_metadata"), prefix="generation"),
         }
     )
     _write_spec_fidelity_review(
@@ -1273,6 +1300,7 @@ def prepare_clarification_artifact(
     payload["codex_events"] = str(agent_result.events_path)
     payload["last_message"] = str(agent_result.last_message_path)
     payload["agent_stderr"] = redact_text(agent_result.stderr)
+    payload.update(codex_run_metadata_summary_fields(agent_result.run_metadata))
     _write_clarification_artifact(out_path, payload)
     canonical = _canonical_clarification_questions_path(artifact_dir)
     if canonical.resolve() != out_path.resolve():
@@ -1377,6 +1405,7 @@ def solve_clarified_artifact(
         "spec_validation_returncode": spec_result.get("validation_returncode"),
         "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
         "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        **codex_run_metadata_summary_fields(spec_result.get("codex_run_metadata"), prefix="spec"),
         "spec_fidelity_status": "not_reviewed",
         "spec_fidelity_review": _relative(spec_fidelity_review_path, resolution_dir),
         "spec_fidelity_report": _relative(spec_fidelity_report_path, resolution_dir),
@@ -1437,6 +1466,7 @@ def solve_clarified_artifact(
             "verify_returncode": verification.returncode,
             "verify_stdout": verification.stdout,
             "verify_stderr": verification.stderr,
+            **codex_run_metadata_summary_fields(generation.get("codex_run_metadata"), prefix="generation"),
         }
     )
     _write_spec_fidelity_review(
@@ -1507,6 +1537,7 @@ def generate_problem_spec(
             "agent_stderr": redact_text(agent_result.stderr),
             "repair_input_error": repair_error,
         }
+        attempt_payload.update(codex_run_metadata_summary_fields(agent_result.run_metadata))
 
         problem = extract_json_object(agent_result.raw_text)
         if problem is None:
@@ -1556,6 +1587,7 @@ def generate_problem_spec(
         "spec_repair_status": _spec_repair_status(attempts, initial_repair_requested=initial_repair_requested),
         "spec_attempts": attempts,
     }
+    payload.update(codex_run_metadata_summary_fields(final_attempt.get("codex_run_metadata")))
     for key in ("validation_returncode", "validation_stdout", "validation_stderr"):
         if key in final_attempt:
             payload[key] = final_attempt[key]
@@ -1621,13 +1653,7 @@ def generate_agent_submission(
         problem=inputs.problem,
         problem_path=inputs.problem_path.resolve(),
         paths=paths,
-        options=CodexAgentOptions(
-            codex_model=args.codex_model,
-            codex_sandbox=args.codex_sandbox,
-            codex_approval=args.codex_approval,
-            max_repair_attempts=args.max_repair_attempts,
-            timeout_seconds=args.codex_timeout_seconds,
-        ),
+        options=_codex_options_from_args(args),
         verify_command=or_ci_command()[0],
     )
 
@@ -1656,6 +1682,7 @@ def generate_agent_submission(
             "codex_events": paths.events_path,
         }
     )
+    payload.update(codex_run_metadata_summary_fields(result.run_metadata))
     return payload
 
 
@@ -1805,6 +1832,7 @@ def _run_repaired_solve_from_fidelity(
         "spec_validation_returncode": spec_result.get("validation_returncode"),
         "spec_attempt_count": spec_result.get("spec_attempt_count", 1),
         "spec_repair_status": spec_result.get("spec_repair_status", "not_needed"),
+        **codex_run_metadata_summary_fields(spec_result.get("codex_run_metadata"), prefix="spec"),
         "spec_fidelity_status": "not_reviewed",
         "spec_fidelity_review": _relative(spec_fidelity_review_path, resolution_dir),
         "spec_fidelity_report": _relative(spec_fidelity_report_path, resolution_dir),
@@ -1865,6 +1893,7 @@ def _run_repaired_solve_from_fidelity(
             "verify_returncode": verification.returncode,
             "verify_stdout": verification.stdout,
             "verify_stderr": verification.stderr,
+            **codex_run_metadata_summary_fields(generation.get("codex_run_metadata"), prefix="generation"),
         }
     )
     _write_spec_fidelity_review(
@@ -2078,6 +2107,7 @@ def _capability_summary_fields(result: dict[str, Any]) -> dict[str, Any]:
         "capability_agent_returncode": result.get("agent_returncode"),
         "capability_agent_timed_out": result.get("agent_timed_out"),
         "capability_agent_stderr": result.get("agent_stderr", ""),
+        **codex_run_metadata_summary_fields(result.get("codex_run_metadata"), prefix="capability"),
     }
     if "confidence" in result:
         fields["capability_confidence"] = result["confidence"]
@@ -2129,7 +2159,19 @@ def normalize_clarification_questions(payload: dict[str, Any], *, source_path: P
         "blocking_status": blocking_status,
         "questions": questions,
     }
-    for key in ("raw_response", "agent_returncode", "agent_timed_out", "codex_events", "last_message", "agent_stderr"):
+    for key in (
+        "raw_response",
+        "agent_returncode",
+        "agent_timed_out",
+        "codex_events",
+        "last_message",
+        "agent_stderr",
+        "codex_run_metadata",
+        "codex_effective_model",
+        "codex_effective_reasoning_effort",
+        "codex_cli_version",
+        "codex_usage",
+    ):
         if key in payload:
             normalized[key] = payload[key]
     return normalized
@@ -2352,6 +2394,7 @@ def _write_clarification_agent_failure_status(
             "codex_events": str(agent_result.events_path),
             "last_message": str(agent_result.last_message_path),
             "agent_stderr": redact_text(agent_result.stderr),
+            **codex_run_metadata_summary_fields(agent_result.run_metadata),
         },
     )
     return status_path
@@ -2435,6 +2478,7 @@ def build_pilot_row(
         "status": verification.status,
         "failure_check": verification.failure_check,
         "checks": verification.checks,
+        **codex_run_metadata_summary_fields(generation.get("codex_run_metadata")),
     }
 
 
@@ -3002,16 +3046,36 @@ def _solve_batch_row(
         "capability_recommended_next_action",
         "capability_review_note",
         "capability_confidence",
+        "capability_codex_effective_model",
+        "capability_codex_effective_reasoning_effort",
+        "capability_codex_cli_version",
+        "capability_codex_usage",
+        "capability_codex_run_metadata",
         "capability",
         "capability_raw",
         "spec_validation_status",
         "spec_attempt_count",
         "spec_repair_status",
+        "spec_codex_effective_model",
+        "spec_codex_effective_reasoning_effort",
+        "spec_codex_cli_version",
+        "spec_codex_usage",
+        "spec_codex_run_metadata",
         "spec_fidelity_status",
         "spec_fidelity_gate_status",
         "spec_fidelity_reviewed_at",
         "spec_fidelity_reviewed_by",
+        "spec_fidelity_codex_effective_model",
+        "spec_fidelity_codex_effective_reasoning_effort",
+        "spec_fidelity_codex_cli_version",
+        "spec_fidelity_codex_usage",
+        "spec_fidelity_codex_run_metadata",
         "model_generation_status",
+        "generation_codex_effective_model",
+        "generation_codex_effective_reasoning_effort",
+        "generation_codex_cli_version",
+        "generation_codex_usage",
+        "generation_codex_run_metadata",
         "verification_status",
         "classification",
         "spec",
@@ -3096,6 +3160,7 @@ def apply_fidelity_review(*, artifact_dir: Path, review: dict[str, Any]) -> dict
             "spec_fidelity_warning_dimension_count": len(_review_warned_dimensions(review)),
             "spec_fidelity_provisional": _review_is_provisional(review, summary),
             "spec_fidelity_materiality": _review_materiality(review),
+            **codex_run_metadata_summary_fields(review.get("codex_run_metadata"), prefix="spec_fidelity"),
         }
     )
     if "confidence" in review:
@@ -3213,6 +3278,7 @@ def _agent_review_payload(artifact_dir: Path, args: argparse.Namespace) -> dict[
         "agent_timed_out": result.timed_out,
         "agent_stderr": redact_text(result.stderr),
     }
+    payload.update(codex_run_metadata_summary_fields(result.run_metadata))
     if confidence is not None:
         payload["confidence"] = confidence
     return payload
@@ -3230,6 +3296,7 @@ def _run_fidelity_review_agent(
     events_path = session_dir / "codex-events.jsonl"
     last_message_path = session_dir / "last-message.md"
     work_dir = neutral_work_dir(artifact_dir, session_name)
+    options = _codex_options_from_args(args)
     for path in (artifact_dir, session_dir, work_dir):
         path.mkdir(parents=True, exist_ok=True)
     last_message_path.unlink(missing_ok=True)
@@ -3250,8 +3317,7 @@ def _run_fidelity_review_agent(
         "-o",
         str(last_message_path),
     ]
-    if args.codex_model:
-        command.extend(["-m", args.codex_model])
+    command.extend(codex_exec_model_args(options))
     command.append("-")
 
     timed_out = False
@@ -3275,6 +3341,7 @@ def _run_fidelity_review_agent(
         timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    run_metadata = build_codex_run_metadata(command=command, options=options, stdout=stdout)
     events_path.write_text(redact_text(stdout), encoding="utf-8")
     if last_message_path.exists():
         raw_text = last_message_path.read_text(encoding="utf-8")
@@ -3288,6 +3355,7 @@ def _run_fidelity_review_agent(
         events_path=events_path,
         last_message_path=last_message_path,
         stderr=redact_text(stderr),
+        run_metadata=run_metadata,
     )
 
 
@@ -3914,6 +3982,7 @@ def _run_capability_agent(
     events_path = session_dir / "codex-events.jsonl"
     last_message_path = session_dir / "last-message.md"
     work_dir = neutral_work_dir(artifact_dir, session_name)
+    options = _codex_options_from_args(args)
     for path in (artifact_dir, session_dir, work_dir):
         path.mkdir(parents=True, exist_ok=True)
     last_message_path.unlink(missing_ok=True)
@@ -3934,8 +4003,7 @@ def _run_capability_agent(
         "-o",
         str(last_message_path),
     ]
-    if args.codex_model:
-        command.extend(["-m", args.codex_model])
+    command.extend(codex_exec_model_args(options))
     command.append("-")
 
     timed_out = False
@@ -3959,6 +4027,7 @@ def _run_capability_agent(
         timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    run_metadata = build_codex_run_metadata(command=command, options=options, stdout=stdout)
     events_path.write_text(redact_text(stdout), encoding="utf-8")
     if last_message_path.exists():
         raw_text = last_message_path.read_text(encoding="utf-8")
@@ -3972,6 +4041,7 @@ def _run_capability_agent(
         events_path=events_path,
         last_message_path=last_message_path,
         stderr=redact_text(stderr),
+        run_metadata=run_metadata,
     )
 
 
@@ -4001,6 +4071,7 @@ def _run_clarification_question_agent(
     events_path = session_dir / "codex-events.jsonl"
     last_message_path = session_dir / "last-message.md"
     work_dir = neutral_work_dir(artifact_dir, session_name)
+    options = _codex_options_from_args(args)
     for path in (artifact_dir, session_dir, work_dir):
         path.mkdir(parents=True, exist_ok=True)
     last_message_path.unlink(missing_ok=True)
@@ -4021,8 +4092,7 @@ def _run_clarification_question_agent(
         "-o",
         str(last_message_path),
     ]
-    if args.codex_model:
-        command.extend(["-m", args.codex_model])
+    command.extend(codex_exec_model_args(options))
     command.append("-")
 
     timed_out = False
@@ -4050,6 +4120,7 @@ def _run_clarification_question_agent(
         timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    run_metadata = build_codex_run_metadata(command=command, options=options, stdout=stdout)
     events_path.write_text(redact_text(stdout), encoding="utf-8")
     if last_message_path.exists():
         raw_text = last_message_path.read_text(encoding="utf-8")
@@ -4063,6 +4134,7 @@ def _run_clarification_question_agent(
         events_path=events_path,
         last_message_path=last_message_path,
         stderr=redact_text(stderr),
+        run_metadata=run_metadata,
     )
 
 
@@ -4163,6 +4235,7 @@ def _normalize_capability_payload(
         "last_message": str(agent_result.last_message_path),
         "agent_stderr": redact_text(agent_result.stderr),
     }
+    payload.update(codex_run_metadata_summary_fields(agent_result.run_metadata))
     if confidence is not None:
         payload["confidence"] = confidence
     return payload
@@ -4191,6 +4264,7 @@ def _run_problem_spec_agent(
     events_path = session_dir / "codex-events.jsonl"
     last_message_path = session_dir / "last-message.md"
     work_dir = neutral_work_dir(artifact_dir, session_name)
+    options = _codex_options_from_args(args)
     for path in (artifact_dir, session_dir, work_dir):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -4210,8 +4284,7 @@ def _run_problem_spec_agent(
         "-o",
         str(last_message_path),
     ]
-    if args.codex_model:
-        command.extend(["-m", args.codex_model])
+    command.extend(codex_exec_model_args(options))
     command.append("-")
 
     timed_out = False
@@ -4242,6 +4315,7 @@ def _run_problem_spec_agent(
         timeout_message = f"codex exec timed out after {args.codex_timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    run_metadata = build_codex_run_metadata(command=command, options=options, stdout=stdout)
     events_path.write_text(redact_text(stdout), encoding="utf-8")
     if last_message_path.exists():
         raw_text = last_message_path.read_text(encoding="utf-8")
@@ -4255,6 +4329,7 @@ def _run_problem_spec_agent(
         events_path=events_path,
         last_message_path=last_message_path,
         stderr=redact_text(stderr),
+        run_metadata=run_metadata,
     )
 
 

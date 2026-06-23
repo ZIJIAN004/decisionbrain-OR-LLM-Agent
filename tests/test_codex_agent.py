@@ -44,6 +44,24 @@ class CodexAgentModeTests(unittest.TestCase):
             )
             self.assertEqual(command[-1], "-")
 
+    def test_command_passes_reasoning_effort_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = _paths(Path(temp_dir), "BWOR-001")
+            options = CodexAgentOptions(
+                codex_model="gpt-5.5",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                max_repair_attempts=3,
+                timeout_seconds=900,
+                codex_reasoning_effort="xhigh",
+            )
+
+            command = build_codex_command(paths, options)
+
+            self.assertEqual(command[command.index("-c") + 1], 'model_reasoning_effort="xhigh"')
+            self.assertEqual(command[command.index("-m") + 1], "gpt-5.5")
+            self.assertLess(command.index("-c"), command.index("-m"))
+
     def test_prompt_documents_fallback_artifact_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = _paths(Path(temp_dir), "BWOR-001")
@@ -162,23 +180,33 @@ class CodexAgentModeTests(unittest.TestCase):
 
             def fake_run(
                 command: list[str],
-                input: str,
-                capture_output: bool,
-                text: bool,
-                check: bool,
-                timeout: int,
+                input: str | None = None,
+                capture_output: bool = True,
+                text: bool = True,
+                check: bool = False,
+                timeout: int | None = None,
             ) -> subprocess.CompletedProcess[str]:
+                if command == ["codex", "--version"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="codex-cli test\n", stderr="")
                 self.assertEqual(command[command.index("-C") + 1], str(paths.work_dir))
+                self.assertIsNotNone(input)
                 self.assertIn("Start now.", input)
                 _write_fallback_artifacts(paths, "BWOR-001")
                 return subprocess.CompletedProcess(
                     command,
                     0,
-                    stdout='{"type":"turn.completed"}\n',
+                    stdout=(
+                        '{"type":"thread.started","thread_id":"thread-test"}\n'
+                        '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3,'
+                        '"reasoning_output_tokens":2}}\n'
+                    ),
                     stderr="",
                 )
 
-            with patch("or_llm_agent.codex_agent.subprocess.run", fake_run):
+            with (
+                patch("or_llm_agent.codex_agent.subprocess.run", fake_run),
+                patch("or_llm_agent.codex_agent.shutil.which", return_value="/usr/local/bin/codex"),
+            ):
                 result = run_codex_agent(
                     problem_id="BWOR-001",
                     record={"en_question": "Build a tiny LP."},
@@ -190,6 +218,9 @@ class CodexAgentModeTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.run_metadata["codex_thread_id"], "thread-test")
+            self.assertEqual(result.run_metadata["codex_usage"]["input_tokens"], 12)
+            self.assertEqual(result.run_metadata["codex_cli_version"], "codex-cli test")
             self.assertTrue(paths.submission_path.is_file())
             self.assertTrue(paths.report_path.is_file())
             self.assertTrue(paths.status_path.is_file())
@@ -202,11 +233,14 @@ class CodexAgentModeTests(unittest.TestCase):
             self.assertEqual(status["generation_mode"], "agent")
             self.assertEqual(status["work_dir"], str(paths.work_dir))
             self.assertEqual(status["agent_manifest"], str(paths.manifest_path))
+            self.assertEqual(status["codex_run_metadata"]["codex_thread_id"], "thread-test")
+            self.assertEqual(status["codex_usage"]["reasoning_output_tokens"], 2)
 
             raw = json.loads(paths.raw_path.read_text(encoding="utf-8"))
             self.assertEqual(raw["returncode"], 0)
             self.assertEqual(raw["work_dir"], str(paths.work_dir))
             self.assertEqual(raw["manifest_path"], str(paths.manifest_path))
+            self.assertEqual(raw["codex_run_metadata"]["codex_usage"]["output_tokens"], 3)
             self.assertEqual(
                 set(raw["harvested_artifacts"]),
                 {
@@ -222,7 +256,9 @@ class CodexAgentModeTests(unittest.TestCase):
             self.assertEqual(manifest["adapter"], "codex-cli")
             self.assertEqual(manifest["problem_id"], "BWOR-001")
             self.assertEqual(manifest["command"], result.command)
+            self.assertEqual(manifest["codex_run_metadata"]["codex_cli_version"], "codex-cli test")
             self.assertEqual(manifest["options"]["codex_sandbox"], "workspace-write")
+            self.assertIsNone(manifest["options"]["codex_reasoning_effort"])
             self.assertEqual(manifest["paths"]["work_dir"], str(paths.work_dir))
             self.assertEqual(manifest["outputs"]["submission_path"], str(paths.submission_path))
             self.assertEqual(manifest["result"]["returncode"], 0)

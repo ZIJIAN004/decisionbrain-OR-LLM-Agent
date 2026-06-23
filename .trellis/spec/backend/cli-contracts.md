@@ -41,6 +41,11 @@ uv run or-llm-agent resolve-fidelity-batch --mode agent --artifact-dir <batch-di
 uv run or-ci validate-spec --problem <problem.json>
 ```
 
+All `--mode agent` commands accept shared nested-Codex options:
+`[--codex-model <model>] [--codex-reasoning-effort <effort>]`
+`[--codex-sandbox <policy>] [--codex-approval <policy>]`
+`[--codex-timeout-seconds <seconds>]`.
+
 ### 3. Contracts
 
 - Provider dispatch remains prefix-based: model names starting with `claude` use
@@ -59,6 +64,16 @@ uv run or-ci validate-spec --problem <problem.json>
   harvests them into the requested artifact directory after `codex exec` exits.
 - `agent` mode writes JSON events with `codex exec --json` and the final agent
   message with `--output-last-message`.
+- `agent` mode must preserve nested Codex provenance in machine-readable
+  artifacts. Outputs include `codex_run_metadata` with schema
+  `codex_run_metadata_v1`, CLI version, redacted command, effective model,
+  effective reasoning effort, config/argument source, thread id when available,
+  and parsed token usage from `codex exec --json` events.
+- `--codex-reasoning-effort <effort>` passes
+  `model_reasoning_effort=<effort>` to nested `codex exec` with `-c`. If
+  `--codex-model` or `--codex-reasoning-effort` is omitted, artifact metadata
+  records the effective value read from top-level `~/.codex/config.toml` when
+  available.
 - Provider environment keys are `OPENAI_API_KEY` and optional
   `OPENAI_API_BASE` for OpenAI-compatible models; `CLAUDE_API_KEY` or
   `ANTHROPIC_API_KEY` for Claude models.

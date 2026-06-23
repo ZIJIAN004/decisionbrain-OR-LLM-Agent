@@ -1914,9 +1914,17 @@ class ProblemSpecGenerationTests(unittest.TestCase):
                 "review_note": "Source statement and generated spec match.",
                 "evidence": ["objective and price field match"],
             }
+            run_metadata = {
+                "schema_version": "codex_run_metadata_v1",
+                "adapter": "codex-cli",
+                "codex_effective_model": "gpt-5.5",
+                "codex_effective_reasoning_effort": "xhigh",
+                "codex_cli_version": "codex-cli test",
+                "codex_usage": {"input_tokens": 10, "reasoning_output_tokens": 4},
+            }
             with patch(
                 "or_llm_agent.cli._run_fidelity_review_agent",
-                return_value=_review_agent_result(root, payload),
+                return_value=_review_agent_result(root, payload, run_metadata=run_metadata),
             ):
                 exit_code = main(["review-fidelity", "--mode", "agent", "--artifact-dir", str(artifact_dir)])
 
@@ -1930,8 +1938,12 @@ class ProblemSpecGenerationTests(unittest.TestCase):
             self.assertEqual(summary["spec_fidelity_rubric_version"], "source_fidelity_v1")
             self.assertTrue(summary["spec_fidelity_rubric_complete"])
             self.assertEqual(summary["spec_fidelity_blocking_dimension_count"], 0)
+            self.assertEqual(summary["spec_fidelity_codex_effective_model"], "gpt-5.5")
+            self.assertEqual(summary["spec_fidelity_codex_effective_reasoning_effort"], "xhigh")
+            self.assertEqual(summary["spec_fidelity_codex_usage"]["reasoning_output_tokens"], 4)
             report = json.loads((artifact_dir / "spec" / "fidelity-review.json").read_text(encoding="utf-8"))
             self.assertEqual(report["review"]["reviewer"], "codex-agent")
+            self.assertEqual(report["review"]["codex_effective_model"], "gpt-5.5")
             self.assertEqual(report["dimensions"]["objective"]["status"], "pass")
             self.assertEqual(report["automatic_checks"][2]["status"], "PASS")
 
@@ -2457,7 +2469,7 @@ def _agent_result(root: Path, payload: dict) -> ProblemSpecAgentResult:
     )
 
 
-def _review_agent_result(root: Path, payload: dict) -> FidelityReviewAgentResult:
+def _review_agent_result(root: Path, payload: dict, run_metadata: dict | None = None) -> FidelityReviewAgentResult:
     return FidelityReviewAgentResult(
         raw_text=json.dumps(payload, indent=2),
         returncode=0,
@@ -2465,6 +2477,7 @@ def _review_agent_result(root: Path, payload: dict) -> FidelityReviewAgentResult
         events_path=root / "review-events.jsonl",
         last_message_path=root / "review-last-message.md",
         stderr="",
+        run_metadata=run_metadata or {},
     )
 
 

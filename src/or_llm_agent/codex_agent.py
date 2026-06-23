@@ -5,7 +5,8 @@ import json
 import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ class CodexAgentOptions:
     codex_approval: str
     max_repair_attempts: int
     timeout_seconds: int | None
+    codex_reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class CodexAgentResult:
     events_path: Path
     last_message_path: Path
     status_path: Path
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def build_agent_paths(
@@ -115,6 +118,7 @@ def run_codex_agent(
         timeout_message = f"codex exec timed out after {options.timeout_seconds} seconds"
         stderr = f"{stderr.rstrip()}\n{timeout_message}\n" if stderr else timeout_message + "\n"
 
+    run_metadata = build_codex_run_metadata(command=command, options=options, stdout=stdout)
     harvested = _harvest_work_dir_artifacts(paths)
     manifest_payload = _build_run_manifest(
         problem_id=problem_id,
@@ -125,6 +129,7 @@ def run_codex_agent(
         returncode=returncode,
         timed_out=timed_out,
         harvested_artifacts=harvested,
+        run_metadata=run_metadata,
     )
     paths.manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     paths.events_path.write_text(redact_text(stdout), encoding="utf-8")
@@ -140,6 +145,7 @@ def run_codex_agent(
         "harvested_artifacts": harvested,
         "stderr": redact_text(stderr),
     }
+    raw_payload.update(codex_run_metadata_summary_fields(run_metadata))
     if not paths.last_message_path.exists():
         paths.last_message_path.write_text(
             "Nested Codex did not produce a final message before exit.\n",
@@ -162,6 +168,7 @@ def run_codex_agent(
             "agent_manifest": str(paths.manifest_path),
         }
     )
+    status_payload.update(codex_run_metadata_summary_fields(run_metadata))
     paths.status_path.write_text(json.dumps(status_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return CodexAgentResult(
         returncode=returncode,
@@ -170,6 +177,7 @@ def run_codex_agent(
         events_path=paths.events_path,
         last_message_path=paths.last_message_path,
         status_path=paths.status_path,
+        run_metadata=run_metadata,
     )
 
 
@@ -186,6 +194,172 @@ def _read_existing_status(path: Path) -> dict[str, Any]:
     return {"nested_status": existing}
 
 
+def build_codex_run_metadata(
+    *,
+    command: list[str],
+    options: CodexAgentOptions,
+    stdout: str,
+) -> dict[str, Any]:
+    config = _codex_config_values()
+    effective_model, model_source = _effective_codex_value(options.codex_model, config.get("model"))
+    effective_effort, effort_source = _effective_codex_value(
+        options.codex_reasoning_effort,
+        config.get("model_reasoning_effort"),
+    )
+    return {
+        "schema_version": "codex_run_metadata_v1",
+        "adapter": "codex-cli",
+        "codex_model_arg": options.codex_model or "",
+        "codex_reasoning_effort_arg": options.codex_reasoning_effort or "",
+        "codex_effective_model": effective_model,
+        "codex_effective_model_source": model_source,
+        "codex_effective_reasoning_effort": effective_effort,
+        "codex_effective_reasoning_effort_source": effort_source,
+        "codex_cli_version": _codex_cli_version(),
+        "codex_config_path": str(_codex_config_path()),
+        "codex_command": [redact_text(item) for item in command],
+        "codex_command_string": redact_text(shlex.join(command)),
+        "codex_thread_id": _extract_codex_thread_id(stdout),
+        "codex_usage": _extract_codex_usage(stdout),
+    }
+
+
+def codex_run_metadata_summary_fields(
+    metadata: dict[str, Any] | None,
+    *,
+    prefix: str = "",
+) -> dict[str, Any]:
+    if not isinstance(metadata, dict) or not metadata:
+        return {}
+    stem = f"{prefix}_" if prefix else ""
+    return {
+        f"{stem}codex_run_metadata": metadata,
+        f"{stem}codex_effective_model": metadata.get("codex_effective_model", ""),
+        f"{stem}codex_effective_reasoning_effort": metadata.get("codex_effective_reasoning_effort", ""),
+        f"{stem}codex_cli_version": metadata.get("codex_cli_version", ""),
+        f"{stem}codex_usage": metadata.get("codex_usage", {}),
+    }
+
+
+def codex_exec_model_args(options: CodexAgentOptions) -> list[str]:
+    command: list[str] = []
+    if options.codex_reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={json.dumps(options.codex_reasoning_effort)}"])
+    if options.codex_model:
+        command.extend(["-m", options.codex_model])
+    return command
+
+
+def _effective_codex_value(requested: str | None, configured: str | None) -> tuple[str, str]:
+    if requested:
+        return requested, "arg"
+    if configured:
+        return configured, "codex_config"
+    return "", "unknown"
+
+
+def _codex_config_path() -> Path:
+    return Path.home() / ".codex" / "config.toml"
+
+
+@lru_cache(maxsize=1)
+def _codex_config_values() -> dict[str, str]:
+    path = _codex_config_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    section = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped.strip("[]").strip()
+            continue
+        if section:
+            continue
+        key, separator, raw_value = stripped.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if key not in {"model", "model_reasoning_effort"}:
+            continue
+        value = _simple_toml_string_value(raw_value.strip())
+        if value:
+            values[key] = value
+    return values
+
+
+def _simple_toml_string_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value.strip('"')
+        return parsed if isinstance(parsed, str) else ""
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    return value.split("#", 1)[0].strip()
+
+
+@lru_cache(maxsize=1)
+def _codex_cli_version() -> str:
+    if shutil.which("codex") is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["codex", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    version = (result.stdout or result.stderr).strip()
+    return redact_text(version)
+
+
+def _extract_codex_usage(stdout: str) -> dict[str, Any]:
+    usage: dict[str, Any] = {}
+    for event in _iter_codex_json_events(stdout):
+        candidate = event.get("usage")
+        if not isinstance(candidate, dict):
+            turn = event.get("turn")
+            candidate = turn.get("usage") if isinstance(turn, dict) else None
+        if isinstance(candidate, dict):
+            usage = candidate
+    return usage
+
+
+def _extract_codex_thread_id(stdout: str) -> str:
+    for event in _iter_codex_json_events(stdout):
+        candidate = event.get("thread_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        thread = event.get("thread")
+        if isinstance(thread, dict) and isinstance(thread.get("id"), str):
+            return thread["id"]
+    return ""
+
+
+def _iter_codex_json_events(stdout: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
 def _build_run_manifest(
     *,
     problem_id: str,
@@ -196,14 +370,17 @@ def _build_run_manifest(
     returncode: int,
     timed_out: bool,
     harvested_artifacts: list[str],
+    run_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": "swe_agent_run_manifest_v1",
         "adapter": "codex-cli",
         "problem_id": problem_id,
         "command": command,
+        "codex_run_metadata": run_metadata,
         "options": {
             "codex_model": options.codex_model,
+            "codex_reasoning_effort": options.codex_reasoning_effort,
             "codex_sandbox": options.codex_sandbox,
             "codex_approval": options.codex_approval,
             "max_repair_attempts": options.max_repair_attempts,
@@ -249,8 +426,7 @@ def build_codex_command(paths: CodexAgentPaths, options: CodexAgentOptions) -> l
         "-o",
         str(paths.last_message_path),
     ]
-    if options.codex_model:
-        command.extend(["-m", options.codex_model])
+    command.extend(codex_exec_model_args(options))
     command.append("-")
     return command
 
