@@ -80,13 +80,10 @@ def stage_workspace(paper_id: str, instance_index: int) -> Path:
         shutil.rmtree(workspace)
     workspace.mkdir(parents=True)
 
-    # A copy, not a link: the agent has a shell, and a hard link or symlink
-    # would let a stray write reach the original benchmark data through the
-    # same inode. The largest instance is 1.8 GB against 776 GB free.
-    source = instance_path(paper_id, instance_index)
-    target = workspace / INSTANCE_FILENAME
-    shutil.copyfile(source, target)
-    target.chmod(0o444)
+    # shutil.copy2, matching DecisionBrain's runner (benchmark/runner.py:698).
+    # problem.md is not staged here: unlike DecisionBrain's agent, which reads it
+    # through its tools, OR-LLM-Agent receives the statement as its prompt.
+    shutil.copy2(instance_path(paper_id, instance_index), workspace / INSTANCE_FILENAME)
     return workspace
 
 
