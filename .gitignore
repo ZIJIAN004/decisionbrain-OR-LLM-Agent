@@ -203,3 +203,8 @@ artifacts/*
 
 # Local tool/source checkouts.
 /pylsp/
+workspaces/
+__pycache__/
+*.pyc
+adapter-report.jsonl
+adapter-logs/
