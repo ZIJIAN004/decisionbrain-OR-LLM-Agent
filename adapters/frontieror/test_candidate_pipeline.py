@@ -10,7 +10,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from adapters.frontieror import result_adapter, schedule
+from adapters.frontieror import result_adapter, schedule, tool_loop
 from adapters.frontieror.solver_runner import OptimizeTransformer, execute
 
 
@@ -74,7 +74,9 @@ class CandidatePipelineTests(unittest.TestCase):
             self.assertEqual(payload["variables"], {"x[0]": 1.0})
             self.assertTrue((Path(raw_root) / "raw_candidates" / "attempt-1.json").is_file())
 
-    def test_result_adapter_retries_schema_tool_errors(self) -> None:
+    def test_result_adapter_fails_after_one_schema_error(self) -> None:
+        self.assertEqual(result_adapter.config.RESULT_ADAPTER_MAX_ATTEMPTS, 1)
+        self.assertEqual(tool_loop.MAX_TOOL_ROUNDS, 10)
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             workspace = root / "workspaces" / "demo"
@@ -101,17 +103,16 @@ class CandidatePipelineTests(unittest.TestCase):
             )
             (input_dir / "problem.md").write_text("Return x.", encoding="utf-8")
 
-            replies = iter(['{"wrong": 1}', '{"x": 1}'])
             with (
                 patch.object(result_adapter.config, "WORKSPACE_ROOT", root / "workspaces"),
                 patch.object(result_adapter.config, "PROBLEM_ROOT", root / "problems"),
-                patch.object(result_adapter, "query_llm_with_tools", side_effect=lambda *a, **k: next(replies)),
+                patch.object(result_adapter, "query_llm_with_tools", return_value='{"wrong": 1}'),
             ):
                 record = result_adapter.adapt("demo", "test-model")
 
-            self.assertEqual(record["status"], "formatted")
-            self.assertEqual(record["attempts"], 2)
-            self.assertEqual(json.loads((workspace / "solution.json").read_text()), {"x": 1})
+            self.assertEqual(record["status"], "format_failed")
+            self.assertEqual(record["attempts"], 1)
+            self.assertFalse((workspace / "solution.json").exists())
 
     def test_scheduler_postprocesses_after_outer_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 import openai
 
-MAX_TOOL_ROUNDS = int(os.environ.get("ADAPTER_MAX_TOOL_ROUNDS", "8"))
+MAX_TOOL_ROUNDS = 10
 
 
 def _client() -> openai.OpenAI:

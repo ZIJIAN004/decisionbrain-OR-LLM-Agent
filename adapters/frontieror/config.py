@@ -54,7 +54,7 @@ TOTAL_CPU_CORES = int(os.environ.get("ADAPTER_TOTAL_CPU_CORES", "24"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_TASK_TIMEOUT", "7200"))
 SOLVER_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_SOLVER_TIMEOUT", "600"))
-RESULT_ADAPTER_MAX_ATTEMPTS = int(os.environ.get("ADAPTER_RESULT_ATTEMPTS", "4"))
+RESULT_ADAPTER_MAX_ATTEMPTS = 1
 
 # The outer task deadline applies only to the original agent. Candidate recovery
 # and schema adaptation deliberately happen after that process has stopped.
