@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,21 +20,34 @@ INSTANCE_ROOT = Path(os.environ.get("FRONTIEROR_INSTANCE_ROOT", "/home/bhz/Front
 PROBLEM_ROOT = Path(
     os.environ.get("FRONTIEROR_PROBLEM_ROOT", "/home/bhz/Decision Brain/benchmarks/frontieror")
 )
-WORKSPACE_ROOT = Path(os.environ.get("ADAPTER_WORKSPACE_ROOT", REPO_ROOT / "runs" / "workspaces"))
+# Run output lives beside the baseline repositories rather than inside this one,
+# so every baseline's results sit together under one parent and nothing a run
+# produces is mixed into the checkout.
+RUNS_ROOT = Path(os.environ.get("ADAPTER_RUNS_ROOT", "/home/bhz/baselines/or-llm-agent-runs"))
+WORKSPACE_ROOT = Path(os.environ.get("ADAPTER_WORKSPACE_ROOT", RUNS_ROOT / "workspaces"))
 
-# Everything a run produces lives under one directory inside the baseline repo,
-# so results are not scattered across /tmp and a run can be archived by copying
-# a single folder.
-RUNS_ROOT = Path(os.environ.get("ADAPTER_RUNS_ROOT", REPO_ROOT / "runs"))
+
+def ensure_import_path() -> None:
+    """Make the upstream modules importable without installing the package.
+
+    or_llm_eval.py sits at the repository root but imports or_llm_agent, which
+    is a src-layout package under src/. The baseline conda environment does not
+    have it installed, so both directories go on the path.
+    """
+    for entry in (REPO_ROOT, REPO_ROOT / "src"):
+        text = str(entry)
+        if text not in sys.path:
+            sys.path.insert(0, text)
 
 
 def new_run_dir(tag: str = "frontieror") -> Path:
-    """runs/<tag>-<UTC timestamp>/ with report.jsonl and logs/ inside it."""
+    """RUNS_ROOT/<tag>-<UTC timestamp>/ with report.jsonl and logs/ inside it."""
     import time
 
     run_dir = RUNS_ROOT / f"{tag}-{time.strftime('%Y%m%d-%H%M%SZ', time.gmtime())}"
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
     return run_dir
+
 
 TOTAL_BUDGET_GB = int(os.environ.get("ADAPTER_TOTAL_BUDGET_GB", "100"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))

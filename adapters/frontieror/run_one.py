@@ -45,6 +45,7 @@ def run(paper_id: str, case: dict, model_name: str, log_path: Path | None = None
         # agent only ever looked inside its own workspace.
         tool_log.append({"tool": name, "arguments": arguments, "result": result[:4000]})
 
+    config.ensure_import_path()
     import or_llm_eval
 
     original_query_llm = or_llm_eval.query_llm
@@ -102,11 +103,10 @@ def main() -> int:
         "--log",
         type=Path,
         default=None,
-        help="defaults to a new runs/single-<timestamp>/logs/<problem>.json",
+        help="defaults to a new single-<timestamp>/logs/<problem>.json under the runs root",
     )
     args = parser.parse_args()
 
-    sys.path.insert(0, str(config.REPO_ROOT))
     cases = config.load_cases()
     if args.problem not in cases:
         parser.error(f"unknown problem {args.problem!r}; not in {config.INDEX_JSON}")
