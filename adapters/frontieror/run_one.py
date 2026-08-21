@@ -98,7 +98,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--problem", required=True, help="paper_id from the suite index")
     parser.add_argument("--model", default=os.environ.get("LLM_CHAT_MODEL", "deepseek-v4-flash"))
-    parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help="defaults to a new runs/single-<timestamp>/logs/<problem>.json",
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, str(config.REPO_ROOT))
@@ -106,7 +111,12 @@ def main() -> int:
     if args.problem not in cases:
         parser.error(f"unknown problem {args.problem!r}; not in {config.INDEX_JSON}")
 
-    result = run(args.problem, cases[args.problem], args.model, args.log)
+    # A run always leaves a record. The scheduler passes an explicit path so all
+    # of its tasks land in one run folder; a bare single-task run gets its own.
+    log_path = args.log or (config.new_run_dir("single") / "logs" / f"{args.problem}.json")
+    print(f"log: {log_path}", file=sys.stderr, flush=True)
+
+    result = run(args.problem, cases[args.problem], args.model, log_path)
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
