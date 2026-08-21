@@ -1,10 +1,11 @@
 #!/bin/sh
 # Verify the sandbox actually holds, by replaying what the agent really did.
 #
-# The escape commands below are copied verbatim from the tool transcript of the
-# delage2022 run (or-llm-agent-runs/delage2022-test.json, calls 3/5/6/9/10/11):
-# outside the sandbox every one of them returned data, and call 10 returned the
-# reference objective. Inside it they must all return nothing.
+# The escape commands in section 1 are copied verbatim from the tool transcript
+# of the delage2022 run (or-llm-agent-runs/delage2022-test.json, calls
+# 3/5/6/9/10/11): outside the sandbox every one of them returned data, and call
+# 10 returned the reference objective. Inside it they must return nothing --
+# except the task's own instance, which must still be there.
 #
 # Exit code 0 means every check passed. Anything else means do not rely on it.
 
@@ -18,6 +19,15 @@ FAIL=0
 mkdir -p "$WS"
 echo '{"machine_length": 100, "cost_setup_pattern": 1}' > "$WS/instance.json"
 
+# Gurobi's licence is issued to a user name and resolved with
+# getpwuid(geteuid()). With no /etc/passwd in the sandbox the lookup returns
+# nothing and the licence is refused ("current user is ''"). Bind a passwd
+# holding this user's line only, rather than the host's full user list.
+SBX=$(dirname "$WS")/etc
+mkdir -p "$SBX"
+getent passwd "$(id -u)" > "$SBX/passwd"
+getent group  "$(id -g)" > "$SBX/group"
+
 # Ubuntu 24.04 is merged-usr: /bin /lib /lib64 /sbin are symlinks into /usr,
 # so bind /usr once and recreate the symlinks rather than binding each.
 box() {
@@ -25,6 +35,8 @@ box() {
         --ro-bind /usr /usr \
         --symlink usr/bin /bin --symlink usr/sbin /sbin \
         --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+        --ro-bind "$SBX/passwd" /etc/passwd \
+        --ro-bind "$SBX/group" /etc/group \
         --ro-bind /etc/resolv.conf /etc/resolv.conf \
         --ro-bind /etc/ssl /etc/ssl \
         --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
@@ -56,16 +68,22 @@ else
     exit 2
 fi
 
-# --- 1. the fence: replayed escapes must return nothing -----------------------
+# --- 1. the fence: replayed escapes ------------------------------------------
 say ''
-say '[1] replayed escape attempts (must all be empty)'
+say '[1] replayed escape attempts'
 empty() {
-    label=$1; shift
-    out=$(box /bin/sh -c "$1" 2>&1)
-    if [ -z "$out" ]; then pass "$label"; else bad "$label -> $(printf '%s' "$out" | head -3 | tr '\n' '|')"; fi
+    out=$(box /bin/sh -c "$2" 2>&1)
+    if [ -z "$out" ]; then pass "$1"; else bad "$1 -> $(printf '%s' "$out" | head -3 | tr '\n' '|')"; fi
 }
-empty 'find / for instance json (transcript call 3)' \
-      'find / -name "*.json" -path "*instance*" 2>/dev/null'
+only() {
+    out=$(box /bin/sh -c "$3" 2>&1 | tr '\n' ' ' | sed 's/ *$//')
+    if [ "$out" = "$2" ]; then pass "$1"; else bad "$1 -> $out"; fi
+}
+
+# The task's own instance must survive: a fence that hides it too is useless.
+# Outside the sandbox this command returns all 65 cases plus the answer tree.
+only 'find / for instance json (call 3)' '/work/instance.json' \
+     'find / -name "*.json" -path "*instance*" 2>/dev/null'
 empty 'find /home/bhz for delage (call 5)' \
       'find /home/bhz -iname "*delage*" 2>/dev/null'
 empty 'ls the answer directory (call 6)' \
@@ -80,6 +98,8 @@ empty 'the other tree (call 11)' \
       'ls /home/bhz/FrontierOR_large/ 2>/dev/null'
 empty 'the sibling baseline artifacts' \
       'ls /home/bhz/baselines/OptiMUS-v2/data/frontieror/ 2>/dev/null'
+empty 'earlier runs of this baseline' \
+      'ls /home/bhz/baselines/or-llm-agent-runs/ 2>/dev/null'
 empty 'python open(), not just shell' \
       "$PY -c \"print(open('/home/bhz/FrontierOR_all/delage2022/gurobi_solution/large_solution_3.json').read())\" 2>/dev/null"
 
@@ -97,7 +117,10 @@ out=$(box /bin/sh -c 'cat /proc/self/mountinfo 2>/dev/null | grep -c FrontierOR'
 # --- 3. the work still works -------------------------------------------------
 say ''
 say '[3] the sandbox does not break the task'
-out=$(box "$PY" -c "import json;print(json.load(open('instance.json'))['machine_length'])" 2>&1)
+out=$(box /bin/sh -c 'id -un 2>&1')
+[ "$out" = "$(id -un)" ] && pass "runs as $out" || bad "identity inside is '$out', expected '$(id -un)'"
+
+out=$(box "$PY" -c "import json;print(json.load(open('instance.json'))['machine_length'])" 2>&1 | tail -1)
 [ "$out" = 100 ] && pass 'reads instance.json by relative path' || bad "instance.json: $out"
 
 out=$(box "$PY" -c "
