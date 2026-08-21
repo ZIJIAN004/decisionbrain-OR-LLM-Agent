@@ -19,7 +19,21 @@ INSTANCE_ROOT = Path(os.environ.get("FRONTIEROR_INSTANCE_ROOT", "/home/bhz/Front
 PROBLEM_ROOT = Path(
     os.environ.get("FRONTIEROR_PROBLEM_ROOT", "/home/bhz/Decision Brain/benchmarks/frontieror")
 )
-WORKSPACE_ROOT = Path(os.environ.get("ADAPTER_WORKSPACE_ROOT", REPO_ROOT / "workspaces"))
+WORKSPACE_ROOT = Path(os.environ.get("ADAPTER_WORKSPACE_ROOT", REPO_ROOT / "runs" / "workspaces"))
+
+# Everything a run produces lives under one directory inside the baseline repo,
+# so results are not scattered across /tmp and a run can be archived by copying
+# a single folder.
+RUNS_ROOT = Path(os.environ.get("ADAPTER_RUNS_ROOT", REPO_ROOT / "runs"))
+
+
+def new_run_dir(tag: str = "frontieror") -> Path:
+    """runs/<tag>-<UTC timestamp>/ with report.jsonl and logs/ inside it."""
+    import time
+
+    run_dir = RUNS_ROOT / f"{tag}-{time.strftime('%Y%m%d-%H%M%SZ', time.gmtime())}"
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 TOTAL_BUDGET_GB = int(os.environ.get("ADAPTER_TOTAL_BUDGET_GB", "100"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))

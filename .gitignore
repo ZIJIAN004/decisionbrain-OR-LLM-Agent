@@ -203,7 +203,7 @@ artifacts/*
 
 # Local tool/source checkouts.
 /pylsp/
-workspaces/
+runs/
 __pycache__/
 *.pyc
 adapter-report.jsonl
