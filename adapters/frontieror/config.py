@@ -90,6 +90,10 @@ Two requirements for the program you will write later:
    Do not copy values into the source, and do not assume any other location.
 2. Leave the Gurobi solver log on. Do not set `OutputFlag` to 0 or otherwise
    suppress output; the objective value is read from the solver log.
+
+3. The evaluator enforces a hard {SOLVER_TIMEOUT_SECONDS}-second limit on every
+   `model.optimize()` call and saves the best incumbent whenever Gurobi reports
+   `TIME_LIMIT`. Do not design the program as if unlimited solve time were available.
 """
 
 
