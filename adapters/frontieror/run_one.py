@@ -30,11 +30,17 @@ import time
 from pathlib import Path
 
 from . import config, tools
+from .execution import build_executor
 from .tool_loop import query_llm_with_tools
 from .workspace import Workspace
 
 
-def run(paper_id: str, case: dict, model_name: str, log_path: Path | None = None) -> dict:
+def run(
+    paper_id: str,
+    case: dict,
+    model_name: str,
+    log_path: Path | None = None,
+) -> dict:
     workspace = config.stage_workspace(paper_id, case["instance_index"])
     question = config.build_question(paper_id)
 
@@ -49,6 +55,7 @@ def run(paper_id: str, case: dict, model_name: str, log_path: Path | None = None
     import or_llm_eval
 
     original_query_llm = or_llm_eval.query_llm
+    original_execute = or_llm_eval.extract_and_execute_python_code
     state = {"first": True}
     box = Workspace(workspace)
     call_tool = tools.dispatcher(box)
@@ -68,12 +75,14 @@ def run(paper_id: str, case: dict, model_name: str, log_path: Path | None = None
 
     previous_cwd = Path.cwd()
     or_llm_eval.query_llm = query_llm
+    or_llm_eval.extract_and_execute_python_code = build_executor(workspace)
     started = time.time()
     try:
         os.chdir(workspace)
         success, objective = or_llm_eval.or_llm_agent(question, model_name)
     finally:
         or_llm_eval.query_llm = original_query_llm
+        or_llm_eval.extract_and_execute_python_code = original_execute
         os.chdir(previous_cwd)
 
     record_out = {
@@ -116,7 +125,12 @@ def main() -> int:
     log_path = args.log or (config.new_run_dir("single") / "logs" / f"{args.problem}.json")
     print(f"log: {log_path}", file=sys.stderr, flush=True)
 
-    result = run(args.problem, cases[args.problem], args.model, log_path)
+    result = run(
+        args.problem,
+        cases[args.problem],
+        args.model,
+        log_path,
+    )
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0

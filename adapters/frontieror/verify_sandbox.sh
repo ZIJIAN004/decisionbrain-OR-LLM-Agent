@@ -45,7 +45,7 @@ box() {
         --ro-bind /home/bhz/gurobi.lic /home/bhz/gurobi.lic \
         --bind "$WS" /work \
         --tmpfs /tmp --proc /proc --dev /dev \
-        --unshare-pid --unshare-ipc --unshare-uts \
+        --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
         --die-with-parent --new-session \
         --chdir /work \
         -- "$@"
@@ -130,10 +130,13 @@ m.setParam('OutputFlag', 0); m.optimize(); print(round(m.objVal))
 " 2>&1 | tail -1)
 [ "$out" = 3 ] && pass 'gurobipy licenses and solves' || bad "gurobi: $out"
 
-out=$(box "$PY" -c "
-import socket; s=socket.create_connection(('api.deepseek.com',443),10); s.close(); print('net')
-" 2>&1 | tail -1)
-[ "$out" = net ] && pass 'network reaches the LLM endpoint' || bad "network: $out"
+if box "$PY" -c "
+import socket; socket.create_connection(('api.deepseek.com',443),2)
+" >/dev/null 2>&1; then
+    bad 'model-controlled subprocess unexpectedly has network access'
+else
+    pass 'model-controlled subprocess has no network access'
+fi
 
 box /bin/sh -c 'echo written > out.txt' >/dev/null 2>&1
 [ -f "$WS/out.txt" ] && pass 'writes land in the workspace' || bad 'workspace write did not persist'

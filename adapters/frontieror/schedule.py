@@ -25,12 +25,21 @@ from pathlib import Path
 from . import config
 
 
-def _run_task(paper_id: str, model: str, mem_gb: int, run_dir: Path) -> dict:
+def _atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _run_task(
+    paper_id: str, model: str, mem_gb: int, cpu_cores: int, run_dir: Path
+) -> dict:
     """Spawn wrapper.py so this task's resource usage is measured on its own."""
     task_log = run_dir / "logs" / f"{paper_id}.json"
     argv = [
         sys.executable, "-m", "adapters.frontieror.wrapper",
         "--mem-gb", str(mem_gb),
+        "--cpu-cores", str(cpu_cores),
         "--timeout", str(config.TASK_TIMEOUT_SECONDS),
         "--cwd", str(config.REPO_ROOT),
         "--log", str(run_dir / "logs" / f"{paper_id}.log"),
@@ -47,8 +56,7 @@ def _run_task(paper_id: str, model: str, mem_gb: int, run_dir: Path) -> dict:
     try:
         usage = json.loads(proc.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
-        return {
-            "paper_id": paper_id,
+        usage = {
             "outcome": "wrapper_failed",
             "returncode": proc.returncode,
             "stderr": proc.stderr[-2000:],
@@ -62,6 +70,47 @@ def _run_task(paper_id: str, model: str, mem_gb: int, run_dir: Path) -> dict:
             record["result"] = json.loads(task_log.read_text(encoding="utf-8"))["result"]
         except (ValueError, KeyError):
             record["result"] = None
+    # The 7200-second budget ends with the original agent process. Candidate
+    # recovery and schema conversion intentionally run afterwards so a useful
+    # incumbent is not discarded merely because the agent reached its deadline.
+    try:
+        post = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "adapters.frontieror.postprocess",
+                "--problem",
+                paper_id,
+                "--model",
+                model,
+            ],
+            cwd=str(config.REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=config.RESULT_ADAPTER_TIMEOUT_SECONDS,
+            check=False,
+        )
+        record["result_adapter"] = json.loads(post.stdout.strip().splitlines()[-1])
+    except subprocess.TimeoutExpired:
+        record["result_adapter"] = {
+            "status": "adapter_timeout",
+            "schema_valid": False,
+            "raw_candidate_preserved": True,
+        }
+    except (ValueError, IndexError):
+        record["result_adapter"] = {
+            "status": "adapter_failed",
+            "schema_valid": False,
+            "error": (post.stderr or post.stdout)[-2000:],
+        }
+
+    workspace = config.WORKSPACE_ROOT / paper_id
+    raw_candidate = workspace / "raw_candidate.json"
+    solution = workspace / "solution.json"
+    record["raw_candidate"] = str(raw_candidate) if raw_candidate.is_file() else None
+    record["solution"] = str(solution) if solution.is_file() else None
+    record["candidate_available"] = raw_candidate.is_file()
+    _atomic_json(run_dir / "logs" / f"{paper_id}.final.json", record)
     return record
 
 
@@ -74,9 +123,10 @@ def main() -> int:
     parser.add_argument("--run-dir", type=Path, default=None, help="defaults to a new runs/ folder")
     args = parser.parse_args()
 
-    # One knob. The per-task cap is the budget divided by how many run at once,
-    # so the run as a whole cannot exceed the budget however tasks are scheduled.
-    mem_gb = max(1, args.budget_gb // args.jobs)
+    # Every outer task wrapper gets the full memory ceiling. CPU capacity is the
+    # shared resource divided across concurrent jobs; memory is a per-task cap.
+    mem_gb = max(1, args.budget_gb)
+    cpu_cores = max(1, config.TOTAL_CPU_CORES // args.jobs)
 
     cases = config.load_cases()
     if args.only:
@@ -93,34 +143,40 @@ def main() -> int:
     report_path = run_dir / "report.jsonl"
 
     print(f"{len(ordered)} cases | jobs={args.jobs} | {mem_gb} GB per task "
+          f"| {cpu_cores} CPU cores per task "
           f"| {config.TASK_TIMEOUT_SECONDS}s wall | model={args.model}", flush=True)
     print(f"run dir: {run_dir}", flush=True)
 
     started = time.time()
-    with report_path.open("w", encoding="utf-8") as out:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futures = {
-                pool.submit(_run_task, pid, args.model, mem_gb, run_dir): pid
-                for pid, _ in ordered
-            }
-            for future in concurrent.futures.as_completed(futures):
-                paper_id = futures[future]
-                try:
-                    record = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    record = {"paper_id": paper_id, "outcome": "scheduler_failed",
-                              "error": f"{type(exc).__name__}: {exc}"}
-                out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out.flush()
-                result = record.get("result") or {}
-                print(
-                    f"  {paper_id:<20} {record.get('outcome', '?'):<16} "
-                    f"obj={result.get('objective')} "
-                    f"tools={result.get('tool_calls')} "
-                    f"peak={record.get('peak_rss_gb')}GB "
-                    f"{record.get('wall_s')}s",
-                    flush=True,
-                )
+    with (
+        report_path.open("w", encoding="utf-8") as out,
+        concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool,
+    ):
+        futures = {
+            pool.submit(_run_task, pid, args.model, mem_gb, cpu_cores, run_dir): pid
+            for pid, _ in ordered
+        }
+        for future in concurrent.futures.as_completed(futures):
+            paper_id = futures[future]
+            try:
+                record = future.result()
+            except Exception as exc:  # noqa: BLE001
+                record = {
+                    "paper_id": paper_id,
+                    "outcome": "scheduler_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            out.flush()
+            result = record.get("result") or {}
+            print(
+                f"  {paper_id:<20} {record.get('outcome', '?'):<16} "
+                f"obj={result.get('objective')} "
+                f"tools={result.get('tool_calls')} "
+                f"peak={record.get('peak_rss_gb')}GB "
+                f"{record.get('wall_s')}s",
+                flush=True,
+            )
 
     print(f"\ndone in {time.time() - started:.0f}s -> {report_path}", flush=True)
     return 0

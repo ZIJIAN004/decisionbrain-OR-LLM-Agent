@@ -15,10 +15,12 @@ workspace root with directory-changing commands refused.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from pathlib import Path
+
+from .sandbox import SandboxUnavailable
+from .sandbox import command as sandbox_command
 
 # Ported verbatim from decisionbrain/core/workspace_tools.py so that neither
 # system can inspect its instance more cheaply than the other.
@@ -236,8 +238,8 @@ class Workspace:
 
         try:
             completed = subprocess.run(
-                command,
-                shell=True,
+                sandbox_command(self.root, ["/bin/sh", "-c", command]),
+                shell=False,
                 cwd=str(self.root),
                 capture_output=True,
                 text=True,
@@ -246,6 +248,8 @@ class Workspace:
             )
         except subprocess.TimeoutExpired:
             return f"shell error: command exceeded {timeout_s}s and was terminated"
+        except SandboxUnavailable as exc:
+            return f"shell error: {exc}"
 
         output = (completed.stdout or "") + (completed.stderr or "")
         if completed.returncode != 0:

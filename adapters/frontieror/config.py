@@ -50,10 +50,21 @@ def new_run_dir(tag: str = "frontieror") -> Path:
 
 
 TOTAL_BUDGET_GB = int(os.environ.get("ADAPTER_TOTAL_BUDGET_GB", "100"))
+TOTAL_CPU_CORES = int(os.environ.get("ADAPTER_TOTAL_CPU_CORES", "24"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_TASK_TIMEOUT", "7200"))
+SOLVER_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_SOLVER_TIMEOUT", "600"))
+RESULT_ADAPTER_MAX_ATTEMPTS = int(os.environ.get("ADAPTER_RESULT_ATTEMPTS", "4"))
+
+# The outer task deadline applies only to the original agent. Candidate recovery
+# and schema adaptation deliberately happen after that process has stopped.
+RESULT_ADAPTER_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_RESULT_TIMEOUT", "900"))
 
 INSTANCE_FILENAME = "instance.json"
+
+
+def solution_schema_path(paper_id: str) -> Path:
+    return PROBLEM_ROOT / paper_id / "hidden" / "solution_schema.json"
 
 # The only text this adaptation authors. Both paragraphs exist because of how
 # the harness works, not because of anything about the problems:
