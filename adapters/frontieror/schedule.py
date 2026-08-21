@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from . import config
@@ -32,13 +33,19 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 
 def _run_task(
-    paper_id: str, model: str, mem_gb: int, cpu_cores: int, run_dir: Path
+    paper_id: str,
+    model: str,
+    batch_slice: str,
+    memory_budget_gb: int,
+    cpu_cores: int,
+    run_dir: Path,
 ) -> dict:
     """Spawn wrapper.py so this task's resource usage is measured on its own."""
     task_log = run_dir / "logs" / f"{paper_id}.json"
     argv = [
         sys.executable, "-m", "adapters.frontieror.wrapper",
-        "--mem-gb", str(mem_gb),
+        "--batch-slice", batch_slice,
+        "--memory-budget-gb", str(memory_budget_gb),
         "--cpu-cores", str(cpu_cores),
         "--timeout", str(config.TASK_TIMEOUT_SECONDS),
         "--cwd", str(config.REPO_ROOT),
@@ -114,6 +121,43 @@ def _run_task(
     return record
 
 
+def _create_batch_slice(memory_budget_gb: int) -> str:
+    """Create a transient parent cgroup shared by every agent task in this batch."""
+    unit = f"or-llm-frontieror-batch-{uuid.uuid4().hex}.slice"
+    completed = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "set-property",
+            "--runtime",
+            unit,
+            f"MemoryMax={memory_budget_gb}G",
+            "MemorySwapMax=0",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"failed to configure batch memory slice {unit}: {completed.stderr.strip()}"
+        )
+    return unit
+
+
+def _release_batch_slice(unit: str) -> None:
+    subprocess.run(
+        ["systemctl", "--user", "stop", unit],
+        capture_output=True,
+        check=False,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "revert", unit],
+        capture_output=True,
+        check=False,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jobs", type=int, default=config.JOBS)
@@ -123,9 +167,9 @@ def main() -> int:
     parser.add_argument("--run-dir", type=Path, default=None, help="defaults to a new runs/ folder")
     args = parser.parse_args()
 
-    # Every outer task wrapper gets the full memory ceiling. CPU capacity is the
-    # shared resource divided across concurrent jobs; memory is a per-task cap.
-    mem_gb = max(1, args.budget_gb)
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+    memory_budget_gb = max(1, args.budget_gb)
     cpu_cores = max(1, config.TOTAL_CPU_CORES // args.jobs)
 
     cases = config.load_cases()
@@ -142,41 +186,53 @@ def main() -> int:
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
     report_path = run_dir / "report.jsonl"
 
-    print(f"{len(ordered)} cases | jobs={args.jobs} | {mem_gb} GB per task "
+    batch_slice = _create_batch_slice(memory_budget_gb)
+    print(f"{len(ordered)} cases | jobs={args.jobs} | {memory_budget_gb} GB batch memory "
           f"| {cpu_cores} CPU cores per task "
           f"| {config.TASK_TIMEOUT_SECONDS}s wall | model={args.model}", flush=True)
     print(f"run dir: {run_dir}", flush=True)
 
     started = time.time()
-    with (
-        report_path.open("w", encoding="utf-8") as out,
-        concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool,
-    ):
-        futures = {
-            pool.submit(_run_task, pid, args.model, mem_gb, cpu_cores, run_dir): pid
-            for pid, _ in ordered
-        }
-        for future in concurrent.futures.as_completed(futures):
-            paper_id = futures[future]
-            try:
-                record = future.result()
-            except Exception as exc:  # noqa: BLE001
-                record = {
-                    "paper_id": paper_id,
-                    "outcome": "scheduler_failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            out.flush()
-            result = record.get("result") or {}
-            print(
-                f"  {paper_id:<20} {record.get('outcome', '?'):<16} "
-                f"obj={result.get('objective')} "
-                f"tools={result.get('tool_calls')} "
-                f"peak={record.get('peak_rss_gb')}GB "
-                f"{record.get('wall_s')}s",
-                flush=True,
-            )
+    try:
+        with (
+            report_path.open("w", encoding="utf-8") as out,
+            concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool,
+        ):
+            futures = {
+                pool.submit(
+                    _run_task,
+                    pid,
+                    args.model,
+                    batch_slice,
+                    memory_budget_gb,
+                    cpu_cores,
+                    run_dir,
+                ): pid
+                for pid, _ in ordered
+            }
+            for future in concurrent.futures.as_completed(futures):
+                paper_id = futures[future]
+                try:
+                    record = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    record = {
+                        "paper_id": paper_id,
+                        "outcome": "scheduler_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out.flush()
+                result = record.get("result") or {}
+                print(
+                    f"  {paper_id:<20} {record.get('outcome', '?'):<16} "
+                    f"obj={result.get('objective')} "
+                    f"tools={result.get('tool_calls')} "
+                    f"peak={record.get('peak_rss_gb')}GB "
+                    f"{record.get('wall_s')}s",
+                    flush=True,
+                )
+    finally:
+        _release_batch_slice(batch_slice)
 
     print(f"\ndone in {time.time() - started:.0f}s -> {report_path}", flush=True)
     return 0

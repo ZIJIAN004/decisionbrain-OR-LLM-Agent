@@ -30,7 +30,8 @@ SCOPE_CMD = ["systemd-run", "--user", "--scope", "-q"]
 
 def run_capped(
     command: list[str],
-    mem_gb: int,
+    batch_slice: str,
+    memory_budget_gb: int,
     cpu_cores: int,
     timeout_s: int,
     cwd: Path,
@@ -39,8 +40,7 @@ def run_capped(
     unit = f"or-llm-frontieror-{uuid.uuid4().hex}"
     argv = SCOPE_CMD + [
         "--unit", unit,
-        "-p", f"MemoryMax={mem_gb}G",
-        "-p", "MemorySwapMax=0",
+        "--slice", batch_slice,
         "-p", f"CPUQuota={cpu_cores * 100}%",
         *command,
     ]
@@ -77,7 +77,8 @@ def run_capped(
         "cpu_user_s": round(usage.ru_utime, 1),
         "cpu_sys_s": round(usage.ru_stime, 1),
         "wall_s": round(time.time() - started, 1),
-        "mem_cap_gb": mem_gb,
+        "batch_slice": batch_slice,
+        "batch_memory_cap_gb": memory_budget_gb,
         "cpu_cores": cpu_cores,
         "timeout_s": timeout_s,
         "log": str(log_path),
@@ -98,7 +99,8 @@ def classify(returncode: int, timed_out: bool) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mem-gb", type=int, required=True)
+    parser.add_argument("--batch-slice", required=True)
+    parser.add_argument("--memory-budget-gb", type=int, required=True)
     parser.add_argument("--cpu-cores", type=int, required=True)
     parser.add_argument("--timeout", type=int, required=True)
     parser.add_argument("--cwd", type=Path, required=True)
@@ -112,7 +114,8 @@ def main() -> int:
 
     record = run_capped(
         command,
-        args.mem_gb,
+        args.batch_slice,
+        args.memory_budget_gb,
         args.cpu_cores,
         args.timeout,
         args.cwd,

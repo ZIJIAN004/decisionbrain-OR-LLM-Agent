@@ -139,12 +139,27 @@ class CandidatePipelineTests(unittest.TestCase):
                 patch.object(schedule.config, "WORKSPACE_ROOT", root / "workspaces"),
                 patch.object(schedule.subprocess, "run", side_effect=[wrapper, postprocess]),
             ):
-                record = schedule._run_task("demo", "test-model", 1, 8, run_dir)
+                record = schedule._run_task(
+                    "demo", "test-model", "test-batch.slice", 100, 8, run_dir
+                )
 
             self.assertEqual(record["outcome"], "task_timeout")
             self.assertTrue(record["candidate_available"])
             self.assertTrue((run_dir / "logs" / "demo.final.json").is_file())
             self.assertTrue(raw_candidate.is_file())
+
+    def test_batch_slice_gets_one_shared_memory_limit(self) -> None:
+        completed = CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            patch.object(schedule.uuid, "uuid4", return_value=types.SimpleNamespace(hex="abc")),
+            patch.object(schedule.subprocess, "run", return_value=completed) as run,
+        ):
+            unit = schedule._create_batch_slice(100)
+
+        self.assertEqual(unit, "or-llm-frontieror-batch-abc.slice")
+        command = run.call_args.args[0]
+        self.assertIn("MemoryMax=100G", command)
+        self.assertIn("MemorySwapMax=0", command)
 
 
 if __name__ == "__main__":
