@@ -9,6 +9,13 @@ outside the upstream files so the boundary of what was added stays visible.
 It is used for the first LLM call of a task only -- the step that derives the
 mathematical model. Writing the Gurobi code and repairing it afterwards run
 exactly as upstream does.
+
+What the loop observes is appended to the caller's message list rather than
+discarded. or_llm_agent keeps one list for the whole task (or_llm_eval.py:73-107)
+and the later steps read it, so upstream every step could see the numbers, which
+were inline in the prompt. Moving the numbers into a file and letting the
+observations die with this call would leave the code-writing step with only an
+abstract model and no way to know what the fields are actually called.
 """
 
 from __future__ import annotations
@@ -41,13 +48,15 @@ def query_llm_with_tools(
 ) -> str:
     """Run the conversation until the model answers without calling a tool.
 
-    Returns the final assistant text. `on_call` receives (name, arguments,
-    result) for every tool call so the whole exchange can be logged: the log is
-    what makes it checkable afterwards that the agent only ever looked at its
-    own workspace.
+    Returns the final assistant text, and appends the tool exchange to
+    `messages` in place so the steps that follow keep what was observed.
+    `on_call` receives (name, arguments, result) for every tool call so the whole
+    exchange can be logged: the log is what makes it checkable afterwards that
+    the agent only ever looked at its own workspace.
     """
     client = _client()
     conversation = [dict(m) for m in messages]
+    observed = len(conversation)
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.chat.completions.create(
@@ -60,6 +69,7 @@ def query_llm_with_tools(
         calls = message.tool_calls or []
 
         if not calls:
+            messages.extend(conversation[observed:])
             return message.content or ""
 
         conversation.append(
@@ -103,4 +113,5 @@ def query_llm_with_tools(
     final = client.chat.completions.create(
         model=model_name, messages=conversation, temperature=temperature
     )
+    messages.extend(conversation[observed:])
     return final.choices[0].message.content or ""
