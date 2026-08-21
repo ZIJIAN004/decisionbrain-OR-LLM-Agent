@@ -119,11 +119,18 @@ rm -f "$WS/out.txt"
 # --- 4. the host is untouched ------------------------------------------------
 say ''
 say '[4] the host is untouched'
-box /bin/sh -c 'rm -rf /home/bhz/FrontierOR_all 2>/dev/null; touch /home/bhz/CANARY 2>/dev/null' >/dev/null 2>&1
-if [ -d /home/bhz/FrontierOR_all ] && [ ! -e /home/bhz/CANARY ]; then
-    pass 'a destructive command inside changed nothing outside'
+# Deliberately writes only canaries, never deletes: if the mount table were
+# wrong, a delete here would destroy the very data this is meant to protect.
+box /bin/sh -c 'touch /home/bhz/CANARY /usr/CANARY /home/bhz/gurobi1302/CANARY 2>/dev/null' >/dev/null 2>&1
+leaked=""
+for canary in /home/bhz/CANARY /usr/CANARY /home/bhz/gurobi1302/CANARY; do
+    [ -e "$canary" ] && leaked="$leaked $canary"
+done
+if [ -z "$leaked" ]; then
+    pass 'writes to ro-bound and unmounted paths did not reach the host'
 else
-    bad 'HOST WAS MODIFIED -- do not use this mount table'
+    bad "HOST WAS MODIFIED at:$leaked -- do not use this mount table"
+    rm -f $leaked
 fi
 
 say ''
