@@ -6,6 +6,11 @@ import os
 import shutil
 import sys
 from pathlib import Path
+try:
+    import grp
+    import pwd
+except ImportError:  # pragma: no cover - Linux-only sandbox
+    grp = pwd = None
 
 
 class SandboxUnavailable(RuntimeError):
@@ -29,10 +34,15 @@ def command(workspace: Path, argv: list[str]) -> list[str]:
     passwd = sandbox_etc / "passwd"
     group = sandbox_etc / "group"
     passwd.parent.mkdir(parents=True, exist_ok=True)
+    uid, gid = os.getuid(), os.getgid()
+    user = pwd.getpwuid(uid) if pwd is not None else None
+    group_info = grp.getgrgid(gid) if grp is not None else None
+    name = user.pw_name if user else "bhz"
+    group_name = group_info.gr_name if group_info else name
     passwd.write_text(
-        f"bhz:x:{os.getuid()}:{os.getgid()}:sandbox:/work:/bin/sh\n", encoding="utf-8"
+        f"{name}:x:{uid}:{gid}:sandbox:/work:/bin/sh\n", encoding="utf-8"
     )
-    group.write_text(f"bhz:x:{os.getgid()}:\n", encoding="utf-8")
+    group.write_text(f"{group_name}:x:{gid}:{name}\n", encoding="utf-8")
 
     box = [
         "bwrap",
@@ -49,6 +59,7 @@ def command(workspace: Path, argv: list[str]) -> list[str]:
         "--ro-bind", str(env_dir), str(env_dir),
         "--bind", str(workspace), "/work",
         "--tmpfs", "/tmp",
+        "--setenv", "GRB_LICENSE_FILE", str(license_file),
         "--proc", "/proc",
         "--dev", "/dev",
         # Keep the host network namespace so node-locked Gurobi licenses can
