@@ -51,7 +51,9 @@ def command(workspace: Path, argv: list[str]) -> list[str]:
         "--tmpfs", "/tmp",
         "--proc", "/proc",
         "--dev", "/dev",
-        "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
+        # Keep the host network namespace so node-locked Gurobi licenses can
+        # resolve the host ID. Other sandbox isolation remains enabled.
+        "--unshare-pid", "--unshare-ipc", "--unshare-uts",
         "--die-with-parent", "--new-session", "--chdir", "/work",
     ]
     if gurobi_home.exists() and not str(gurobi_home).startswith(str(env_dir)):
