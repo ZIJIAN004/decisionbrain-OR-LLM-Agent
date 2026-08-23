@@ -54,7 +54,9 @@ TOTAL_CPU_CORES = int(os.environ.get("ADAPTER_TOTAL_CPU_CORES", "24"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))
 TASK_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_TASK_TIMEOUT", "7200"))
 SOLVER_TIMEOUT_SECONDS = int(os.environ.get("ADAPTER_SOLVER_TIMEOUT", "600"))
-RESULT_ADAPTER_MAX_ATTEMPTS = 1
+# A formatter response is checked after each tool round. Contract errors are
+# returned to the same adapter conversation for correction, up to ten rounds.
+RESULT_ADAPTER_MAX_ATTEMPTS = int(os.environ.get("ADAPTER_RESULT_MAX_ATTEMPTS", "10"))
 
 # The outer task deadline applies only to the original agent. Candidate recovery
 # and schema adaptation deliberately happen after that process has stopped.

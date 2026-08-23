@@ -74,8 +74,8 @@ class CandidatePipelineTests(unittest.TestCase):
             self.assertEqual(payload["variables"], {"x[0]": 1.0})
             self.assertTrue((Path(raw_root) / "raw_candidates" / "attempt-1.json").is_file())
 
-    def test_result_adapter_fails_after_one_schema_error(self) -> None:
-        self.assertEqual(result_adapter.config.RESULT_ADAPTER_MAX_ATTEMPTS, 1)
+    def test_result_adapter_retries_schema_errors(self) -> None:
+        self.assertEqual(result_adapter.config.RESULT_ADAPTER_MAX_ATTEMPTS, 10)
         self.assertEqual(tool_loop.MAX_TOOL_ROUNDS, 10)
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -111,7 +111,7 @@ class CandidatePipelineTests(unittest.TestCase):
                 record = result_adapter.adapt("demo", "test-model")
 
             self.assertEqual(record["status"], "format_failed")
-            self.assertEqual(record["attempts"], 1)
+            self.assertEqual(record["attempts"], 10)
             self.assertFalse((workspace / "solution.json").exists())
 
     def test_scheduler_postprocesses_after_outer_timeout(self) -> None:
