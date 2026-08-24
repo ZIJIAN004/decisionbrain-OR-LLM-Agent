@@ -12,6 +12,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def _load_env_file(env: dict[str, str], path: Path) -> None:
+    """Load simple KEY=value entries without printing or persisting secrets."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and not env.get(key):
+            env[key] = value
+
+
 def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str,
               model: str, timeout: int) -> dict:
     workspace = workspace_root / paper_id
@@ -37,6 +52,7 @@ def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str
     command = [sys.executable, "-m", "adapters.frontieror.postprocess",
                "--problem", paper_id, "--model", model]
     env = os.environ.copy()
+    _load_env_file(env, Path("/home/bhz/Decision Brain/.env"))
     # The project .env uses LLM_* names and stores the full chat-completions
     # URL. The OpenAI-compatible client expects credential aliases and the API
     # root, otherwise it requests /chat/completions/chat/completions.
@@ -129,7 +145,7 @@ def main() -> int:
         for x in sorted(args.workspace_root.iterdir()):
             if not x.is_dir() or not (x / "raw_candidate.json").is_file():
                 continue
-            retry_checker = prior.get(x.name) in {"checker_execution_error", "checker_timeout"}
+            retry_checker = prior.get(x.name) == "checker_execution_error"
             if not (x / "solution.json").is_file() or retry_checker:
                 ids.append(x.name)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
