@@ -78,13 +78,31 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
     call_tool = tools.dispatcher(box)
 
     for attempt in range(1, config.RESULT_ADAPTER_MAX_ATTEMPTS + 1):
-        response = query_llm_with_tools(
-            messages,
-            model_name=model_name,
-            tool_schemas=tools.schemas(),
-            call_tool=call_tool,
-            temperature=0.0,
-        )
+        try:
+            response = query_llm_with_tools(
+                messages,
+                model_name=model_name,
+                tool_schemas=tools.schemas(),
+                call_tool=call_tool,
+                temperature=0.0,
+            )
+        except Exception as exc:  # adapter/tool failures are recoverable rounds
+            error = {
+                "attempt": attempt,
+                "message": f"{type(exc).__name__}: {exc}",
+                "path": [],
+                "schema_path": [],
+            }
+            errors.append(error)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "The adapter tool call failed. Treat this as a recoverable error, "
+                    "inspect the workspace again, and return a complete corrected JSON object. "
+                    f"Error: {json.dumps(error, ensure_ascii=False)}"
+                ),
+            })
+            continue
         candidate = _extract_json_object(response)
         try:
             if candidate is None:

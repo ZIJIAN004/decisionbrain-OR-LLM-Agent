@@ -31,8 +31,16 @@ def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str
             proc = subprocess.run(command, cwd=str(repo), env=env, stdout=handle,
                                   stderr=subprocess.STDOUT, text=True,
                                   timeout=timeout, check=False)
+            adapter_record = None
+            record_path = workspace / "result_adapter.json"
+            if record_path.is_file():
+                try:
+                    adapter_record = json.loads(record_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    pass
             result.update(returncode=proc.returncode,
-                          status="formatted" if (workspace / "solution.json").is_file() else "format_failed")
+                          adapter=adapter_record,
+                          status="formatted" if adapter_record and adapter_record.get("status") == "formatted" else "format_failed")
         except subprocess.TimeoutExpired:
             result["status"] = "adapter_timeout"
         handle.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] status={result['status']}\n")
