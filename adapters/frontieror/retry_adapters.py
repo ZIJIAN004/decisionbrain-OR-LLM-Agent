@@ -47,7 +47,7 @@ def main() -> int:
     p.add_argument("--workspace-root", type=Path, required=True)
     p.add_argument("--output-root", type=Path, required=True)
     p.add_argument("--model", required=True)
-    p.add_argument("--jobs", type=int, default=8)
+    p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--timeout", type=int, default=1200)
     p.add_argument("--only", nargs="*")
     args = p.parse_args()
