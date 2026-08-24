@@ -37,6 +37,14 @@ def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str
     command = [sys.executable, "-m", "adapters.frontieror.postprocess",
                "--problem", paper_id, "--model", model]
     env = os.environ.copy()
+    # The project .env uses LLM_* names and stores the full chat-completions
+    # URL. The OpenAI-compatible client expects credential aliases and the API
+    # root, otherwise it requests /chat/completions/chat/completions.
+    if not env.get("OPENAI_API_KEY") and env.get("LLM_API_KEY"):
+        env["OPENAI_API_KEY"] = env["LLM_API_KEY"]
+    if not env.get("OPENAI_API_BASE") and env.get("LLM_MODEL_URL"):
+        env["OPENAI_API_BASE"] = env["LLM_MODEL_URL"]
+    env["OPENAI_API_BASE"] = env.get("OPENAI_API_BASE", "").removesuffix("/chat/completions").rstrip("/")
     env["ADAPTER_WORKSPACE_ROOT"] = str(workspace_root)
     with log.open("w", encoding="utf-8", buffering=1) as handle:
         handle.write(json.dumps({
