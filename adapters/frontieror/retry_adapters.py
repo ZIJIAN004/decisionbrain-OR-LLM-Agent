@@ -109,11 +109,29 @@ def main() -> int:
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--timeout", type=int, default=1200)
     p.add_argument("--only", nargs="*")
+    p.add_argument("--checker-report", type=Path,
+                   help="prior hidden-check JSONL; checker execution errors/timeouts are retried")
     args = p.parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
-    ids = args.only or sorted(x.name for x in args.workspace_root.iterdir()
-                               if x.is_dir() and (x / "raw_candidate.json").is_file()
-                               and not (x / "solution.json").is_file())
+    prior = {}
+    if args.checker_report and args.checker_report.is_file():
+        for line in args.checker_report.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("paper_id"):
+                prior[str(row["paper_id"])] = row.get("outcome")
+    if args.only:
+        ids = list(args.only)
+    else:
+        ids = []
+        for x in sorted(args.workspace_root.iterdir()):
+            if not x.is_dir() or not (x / "raw_candidate.json").is_file():
+                continue
+            retry_checker = prior.get(x.name) in {"checker_execution_error", "checker_timeout"}
+            if not (x / "solution.json").is_file() or retry_checker:
+                ids.append(x.name)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         results = list(pool.map(lambda pid: retry_one(args.repo, args.workspace_root,
                                                        args.output_root, pid, args.model,
