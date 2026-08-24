@@ -15,7 +15,11 @@ def main():
     checked={}
     if a.checker_report:
         checked={json.loads(line)['paper_id']:json.loads(line) for line in a.checker_report.read_text().splitlines()}
-    for pid,case in sorted(cases.items()):
+        paper_ids=sorted(checked)
+    else:
+        paper_ids=sorted(cases)
+    for pid in paper_ids:
+        case=cases.get(pid,{})
         c=a.candidate_root/pid/'solution.json'; task=a.task_root/pid; idx=case.get('instance_index') if isinstance(case,dict) else None; inst=a.instance_root/pid/'instance'/f'large_instance_{idx}.json' if idx is not None else None; checker=task/'hidden'/'feasibility_check.py'; ref= a.instance_root/pid/'gurobi_solution'/f'large_solution_{idx}.json' if idx is not None else None
         if not c.is_file(): rows.append({'paper_id':pid,'outcome':'missing_candidate'}); continue
         prior=checked.get(pid)
