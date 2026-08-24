@@ -13,7 +13,7 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('--candidate-root',type=Path,required=True); p.add_argument('--task-root',type=Path,required=True); p.add_argument('--instance-root',type=Path,required=True); p.add_argument('--index',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--timeout',type=int,default=120)
     a=p.parse_args(); index=json.loads(a.index.read_text()); cases=index.get('cases',index); rows=[]; gaps=[]
     for pid,case in sorted(cases.items()):
-        c=a.candidate_root/pid/'solution.json'; task=a.task_root/pid; idx=case.get('instance_index') if isinstance(case,dict) else None; inst=a.instance_root/pid/f'large_instance_{idx}.json' if idx is not None else None; checker=task/'hidden'/'feasibility_check.py'; ref= a.instance_root/pid/'gurobi_solution'/f'large_solution_{idx}.json' if idx is not None else None
+        c=a.candidate_root/pid/'solution.json'; task=a.task_root/pid; idx=case.get('instance_index') if isinstance(case,dict) else None; inst=a.instance_root/pid/'instance'/f'large_instance_{idx}.json' if idx is not None else None; checker=task/'hidden'/'feasibility_check.py'; ref= a.instance_root/pid/'gurobi_solution'/f'large_solution_{idx}.json' if idx is not None else None
         if not c.is_file(): rows.append({'paper_id':pid,'outcome':'missing_candidate'}); continue
         if not inst or not inst.is_file(): rows.append({'paper_id':pid,'outcome':'checker_execution_error','error':'instance missing'}); continue
         with tempfile.TemporaryDirectory(prefix='or-frontieror-check-') as td:
