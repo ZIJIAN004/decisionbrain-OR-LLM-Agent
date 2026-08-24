@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -16,17 +17,35 @@ def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str
     workspace = workspace_root / paper_id
     log = output_root / f"{paper_id}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    result = {"paper_id": paper_id, "log": str(log), "timeout_s": timeout}
+    started = time.time()
+    started_at = datetime.now(timezone.utc).isoformat()
+    result = {
+        "paper_id": paper_id,
+        "log": str(log),
+        "timeout_s": timeout,
+        "started_at": started_at,
+    }
     if not (workspace / "raw_candidate.json").is_file():
         result["status"] = "no_candidate"
+        result["ended_at"] = datetime.now(timezone.utc).isoformat()
+        result["wall_s"] = 0.0
+        log.write_text(
+            json.dumps({"event": "no_candidate", **result}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         return result
-    started = time.time()
     command = [sys.executable, "-m", "adapters.frontieror.postprocess",
                "--problem", paper_id, "--model", model]
     env = os.environ.copy()
     env["ADAPTER_WORKSPACE_ROOT"] = str(workspace_root)
     with log.open("w", encoding="utf-8", buffering=1) as handle:
-        handle.write(json.dumps({"paper_id": paper_id, "command": command}, ensure_ascii=False) + "\n")
+        handle.write(json.dumps({
+            "event": "formatter_start",
+            "paper_id": paper_id,
+            "command": command,
+            "started_at": started_at,
+            "timeout_s": timeout,
+        }, ensure_ascii=False) + "\n")
         try:
             proc = subprocess.run(command, cwd=str(repo), env=env, stdout=handle,
                                   stderr=subprocess.STDOUT, text=True,
@@ -38,14 +57,38 @@ def retry_one(repo: Path, workspace_root: Path, output_root: Path, paper_id: str
                     adapter_record = json.loads(record_path.read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     pass
-            result.update(returncode=proc.returncode,
-                          adapter=adapter_record,
-                          status="formatted" if adapter_record and adapter_record.get("status") == "formatted" else "format_failed")
+            result.update(
+                returncode=proc.returncode,
+                adapter=adapter_record,
+                status=("formatted" if adapter_record and adapter_record.get("status") == "formatted"
+                        else "format_failed"),
+            )
         except subprocess.TimeoutExpired:
             result["status"] = "adapter_timeout"
-        handle.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] status={result['status']}\n")
+            result["returncode"] = None
+            handle.write(json.dumps({
+                "event": "formatter_timeout",
+                "paper_id": paper_id,
+                "timeout_s": timeout,
+            }, ensure_ascii=False) + "\n")
     result["solution_present"] = (workspace / "solution.json").is_file()
+    result["ended_at"] = datetime.now(timezone.utc).isoformat()
     result["wall_s"] = round(time.time() - started, 1)
+    adapter = result.get("adapter") or {}
+    result["adapter_attempts"] = adapter.get("attempts")
+    result["adapter_error_count"] = len(adapter.get("errors", [])) if isinstance(adapter.get("errors"), list) else None
+    with log.open("a", encoding="utf-8", buffering=1) as handle:
+        handle.write(json.dumps({
+            "event": "formatter_end",
+            "paper_id": paper_id,
+            "status": result["status"],
+            "returncode": result.get("returncode"),
+            "solution_present": result["solution_present"],
+            "adapter_attempts": result["adapter_attempts"],
+            "adapter_error_count": result["adapter_error_count"],
+            "ended_at": result["ended_at"],
+            "wall_s": result["wall_s"],
+        }, ensure_ascii=False) + "\n")
     return result
 
 
