@@ -10,6 +10,22 @@ import tempfile
 import time
 from pathlib import Path
 
+# The large-all index does not carry a reliable objective direction.  This
+# mapping was verified against each Agent-visible FrontierOR problem statement.
+MAXIMIZATION_TASKS = frozenset({
+    "bront2009",
+    "caprara1999",
+    "forrest2006",
+    "furini2016",
+    "lai2021",
+    "savelsbergh1997",
+    "wang2025",
+})
+
+
+def objective_direction(paper_id: str) -> str:
+    return "maximize" if paper_id in MAXIMIZATION_TASKS else "minimize"
+
 
 def objective(path: Path):
     try:
@@ -200,7 +216,8 @@ def main() -> int:
             reference_objective = objective(ref) if ref else None
             gap = None
             if candidate_objective is not None and reference_objective not in (None, 0):
-                direction = case.get("objective_direction", "minimize")
+                direction = objective_direction(paper_id)
+                item["objective_direction"] = direction
                 gap = ((candidate_objective - reference_objective) / abs(reference_objective)
                        if direction != "maximize" else
                        (reference_objective - candidate_objective) / abs(reference_objective))
