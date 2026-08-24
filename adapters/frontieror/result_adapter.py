@@ -62,11 +62,14 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
         {
             "role": "system",
             "content": (
-                "You are a result adapter, not an optimizer. Convert the existing raw "
-                "candidate into one JSON object that validates against solution_schema.json. "
-                "Use the workspace tools to inspect raw_candidate.json, solver.py, "
-                "instance.json, and solution_schema.json. Preserve the candidate's decisions; "
-                "do not improve, replace, or fabricate a solution. Return JSON only."
+                "You are a result adapter, not an optimizer. You must convert the existing raw "
+                "candidate by writing a workspace-local Python script named convert_solution.py. "
+                "Use write_file to create or replace that script, then use run_python to execute "
+                "it. The script must read raw_candidate.json and instance/schema files and write "
+                "solution.json at the workspace root. Do not return the solution as chat JSON and "
+                "do not write solution.json directly with shell. Preserve candidate decisions; "
+                "do not optimize, rerun a solver, or fabricate missing values. After execution, "
+                "inspect the tool result and repair the script until solution.json validates."
             ),
         },
         {
@@ -75,16 +78,26 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
         },
     ]
     errors: list[dict[str, Any]] = []
+    tool_transcript: list[dict[str, Any]] = []
     call_tool = tools.dispatcher(box)
 
     for attempt in range(1, config.RESULT_ADAPTER_MAX_ATTEMPTS + 1):
+        # Each attempt must produce a fresh artifact; never accept a stale file
+        # left by an earlier failed conversion.
+        (workspace / "solution.json").unlink(missing_ok=True)
         try:
+            attempt_calls: list[dict[str, Any]] = []
+            def record_call(name: str, arguments: str, result: str) -> None:
+                entry = {"name": name, "arguments": arguments, "result": result[:4000]}
+                attempt_calls.append(entry)
+                tool_transcript.append({"attempt": attempt, **entry})
             response = query_llm_with_tools(
                 messages,
                 model_name=model_name,
                 tool_schemas=tools.schemas(),
                 call_tool=call_tool,
                 temperature=0.0,
+                on_call=record_call,
             )
         except Exception as exc:  # adapter/tool failures are recoverable rounds
             error = {
@@ -103,10 +116,23 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
                 ),
             })
             continue
-        candidate = _extract_json_object(response)
         try:
-            if candidate is None:
-                raise jsonschema.ValidationError("tool output did not contain a JSON object")
+            script_path = workspace / "convert_solution.py"
+            if not script_path.is_file():
+                raise jsonschema.ValidationError(
+                    "convert_solution.py was not created; write the conversion script and run it"
+                )
+            if not any(c["name"] == "run_python" for c in attempt_calls):
+                raise jsonschema.ValidationError(
+                    "convert_solution.py was not executed; call run_python after writing it"
+                )
+            if not (workspace / "solution.json").is_file():
+                raise jsonschema.ValidationError(
+                    "solution.json was not created by convert_solution.py"
+                )
+            candidate = json.loads((workspace / "solution.json").read_text(encoding="utf-8"))
+            if not isinstance(candidate, dict):
+                raise jsonschema.ValidationError("solution.json top level must be an object")
             jsonschema.validate(instance=candidate, schema=schema)
         except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
             error = {
@@ -122,8 +148,9 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
                     {
                         "role": "user",
                         "content": (
-                            "The result-adapter tool rejected that output. Treat this as a "
-                            "recoverable tool error and return a corrected complete JSON object. "
+                            "The conversion script or its output failed validation. Treat this "
+                            "as a recoverable tool error: repair convert_solution.py, run it "
+                            "again, and ensure it writes a complete valid solution.json. "
                             f"Validation error: {json.dumps(error, ensure_ascii=False)}"
                         ),
                     },
@@ -137,6 +164,7 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
             "attempts": attempt,
             "schema_valid": True,
             "errors": errors,
+            "tool_transcript": tool_transcript,
         }
         _atomic_json(workspace / "result_adapter.json", record)
         return record
@@ -147,6 +175,7 @@ def adapt(paper_id: str, model_name: str) -> dict[str, Any]:
         "schema_valid": False,
         "errors": errors,
         "raw_candidate_preserved": True,
+        "tool_transcript": tool_transcript,
     }
     _atomic_json(workspace / "result_adapter.json", record)
     return record

@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
+import sys
 
 from .sandbox import SandboxUnavailable
 from .sandbox import command as sandbox_command
@@ -251,6 +252,41 @@ class Workspace:
         except SandboxUnavailable as exc:
             return f"shell error: {exc}"
 
+        output = (completed.stdout or "") + (completed.stderr or "")
+        if completed.returncode != 0:
+            output += f"\n[exit code {completed.returncode}]"
+        return _truncate(output or "(no output)", MAX_OUTPUT_CHARS)[0]
+
+    def write_file(self, path: str, content: str) -> str:
+        """Write one UTF-8 text file inside the workspace."""
+        target = self._resolve(path)
+        if target == self.root or not target.name:
+            raise WorkspaceToolError("path must name a file")
+        if not isinstance(content, str):
+            raise WorkspaceToolError("content must be a string")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"wrote {self._display(target)} ({target.stat().st_size} bytes)"
+
+    def run_python(self, path: str, timeout_s: int = SHELL_TIMEOUT_S) -> str:
+        """Run a workspace-local Python script inside the normal task sandbox."""
+        target = self._resolve_existing(path, expected="file")
+        if target.suffix != ".py":
+            raise WorkspaceToolError("run_python requires a .py script")
+        try:
+            completed = subprocess.run(
+                sandbox_command(self.root, [sys.executable, str(target)]),
+                shell=False,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=min(int(timeout_s), SHELL_TIMEOUT_S),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return f"python error: command exceeded {timeout_s}s and was terminated"
+        except SandboxUnavailable as exc:
+            return f"python error: {exc}"
         output = (completed.stdout or "") + (completed.stderr or "")
         if completed.returncode != 0:
             output += f"\n[exit code {completed.returncode}]"

@@ -26,6 +26,38 @@ def schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "write_file",
+                "description": "Write UTF-8 text to a file inside the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path."},
+                        "content": {"type": "string", "description": "Complete file contents."},
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_python",
+                "description": "Execute a workspace-local .py script in the task sandbox and return stdout/stderr.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative .py script path."},
+                        "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "list_files",
                 "description": (
                     "List the contents of a directory in the working directory. Each file is "
@@ -122,6 +154,8 @@ def dispatcher(workspace: Workspace) -> Callable[[str, str], str]:
     path or a too-large file is information the model should act on, not a crash.
     """
     handlers = {
+        "write_file": workspace.write_file,
+        "run_python": workspace.run_python,
         "list_files": workspace.list_files,
         "read_file": workspace.read_file,
         "search_file": workspace.search_file,
