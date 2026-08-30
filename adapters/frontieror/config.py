@@ -49,6 +49,27 @@ def new_run_dir(tag: str = "frontieror") -> Path:
     return run_dir
 
 
+# Repair budget, for the budget-controlled re-run only.
+#
+# or_llm_agent runs a fixed three-step script and every loop in it is a repair
+# loop with a counted bound: the first solve gets max_attempts=3 by default, and
+# the two fallback branches call generate_or_code_solver again with 1 and 2
+# hardcoded (or_llm_eval.py:117 and :125). A task therefore gets at most five
+# code generations no matter how much of its wall clock is left, and in the
+# 65-instance run 18 tasks printed "Reached maximum number of attempts" -- 15 of
+# the 16 tasks that ended with no candidate at all. The other 47 tasks produced
+# exactly one such ending between them.
+#
+# Those runs averaged 852 seconds against a 7200-second budget, so what stopped
+# them was the count, not the clock. Setting this raises all three call sites at
+# once and leaves TASK_TIMEOUT_SECONDS as the only bound, which is the bound
+# DecisionBrain runs under. Nothing is lost to a task that is still working when
+# the clock runs out: candidate recovery and schema conversion run after the
+# agent process ends, by design (schedule.py).
+#
+# 0 means "leave the upstream numbers alone", so an ordinary run is unchanged.
+SOLVE_MAX_ATTEMPTS = int(os.environ.get("ADAPTER_SOLVE_MAX_ATTEMPTS", "0")) or None
+
 TOTAL_BUDGET_GB = int(os.environ.get("ADAPTER_TOTAL_BUDGET_GB", "100"))
 TOTAL_CPU_CORES = int(os.environ.get("ADAPTER_TOTAL_CPU_CORES", "24"))
 JOBS = int(os.environ.get("ADAPTER_JOBS", "4"))

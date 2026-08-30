@@ -73,9 +73,21 @@ def run(
             )
         return original_query_llm(messages, model_name=model_name, temperature=temperature)
 
+    # or_llm_agent passes its own max_attempts to the first solve and hardcodes
+    # the two fallback ones, so the budget is raised where all three arrive
+    # rather than at any single call site. The error feedback that drives a
+    # repair lives inside this function, so widening it here keeps every extra
+    # attempt in the same conversation instead of restarting one.
+    original_solver = or_llm_eval.generate_or_code_solver
+
+    def generate_or_code_solver(messages_bak, model_name, max_attempts):
+        return original_solver(messages_bak, model_name, config.SOLVE_MAX_ATTEMPTS)
+
     previous_cwd = Path.cwd()
     or_llm_eval.query_llm = query_llm
     or_llm_eval.extract_and_execute_python_code = build_executor(workspace)
+    if config.SOLVE_MAX_ATTEMPTS:
+        or_llm_eval.generate_or_code_solver = generate_or_code_solver
     started = time.time()
     try:
         os.chdir(workspace)
@@ -83,6 +95,7 @@ def run(
     finally:
         or_llm_eval.query_llm = original_query_llm
         or_llm_eval.extract_and_execute_python_code = original_execute
+        or_llm_eval.generate_or_code_solver = original_solver
         os.chdir(previous_cwd)
 
     record_out = {
@@ -91,6 +104,9 @@ def run(
         "success": bool(success),
         "objective": objective,
         "tool_calls": len(tool_log),
+        # Which repair budget produced this record, so a re-run is told apart
+        # from a published-settings run by its own contents.
+        "solve_max_attempts": config.SOLVE_MAX_ATTEMPTS or "upstream (3/1/2)",
         "wall_s": round(time.time() - started, 1),
         "instance_bytes": case["instance_bytes"],
         "formulation_type": case["formulation_type"],
