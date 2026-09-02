@@ -40,7 +40,7 @@ OUT=${OUT:-/home/bhz/baselines/or-llm-agent-runs/formatter-rerun-$(date -u +%Y%m
 REPO=${REPO:-/home/bhz/baselines/OR-LLM-Agent}
 PY=${PY:-/home/bhz/miniforge3/envs/decisionbrain_baseline/bin/python}
 MODEL=${MODEL:-deepseek-v4-flash}
-JOBS=${JOBS:-6}
+JOBS=${JOBS:-8}
 TIMEOUT=${TIMEOUT:-1200}
 
 IDS="bertsimas2022 bierwirth2017 bollapragada2001 bragin2022 bront2009 byeon2022 \
